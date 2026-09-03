@@ -21,7 +21,7 @@ if "get_research_agent()" in src and "import get_research_agent" not in src:
 
 # 2. Replace bare factory-object names with their get_X() calls.
 #    \\b already prevents matching inside get_crawler/get_summarizer/etc,
-#    since '_' and the following letter are both word chars (no boundary).
+#    since \'_\\\' and the following letter are both word chars (no boundary).
 #    Import/from lines are skipped so `from crawler.engine import ...`
 #    is never touched.
 bare_names = ["aggregator", "crawler", "summarizer",
@@ -39,11 +39,11 @@ for name in bare_names:
             src_lines[i] = new_line
             count += n
     if count:
-        notes.append(f"replaced {count}x bare \'{name}.\' -> \'get_{name}().\'.")
+        notes.append(f"replaced {count}x bare \'{name}.\' -> \'get_{name}().\'")
 src = "\\n".join(src_lines)
 
 # 3. Fix zero-arg lines.append() -> lines.append("")
-new_src, n = re.subn(r\'lines\.append\(\)\', \'lines.append("")\', src)
+new_src, n = re.subn(r\'lines\\.append\\(\)\', r\'lines.append("")\', src)
 if n:
     notes.append(f"fixed {n}x empty lines.append()")
 src = new_src
@@ -56,7 +56,7 @@ for n in notes:
     print(" -", n)
 
 remaining = re.findall(
-    r"\\b(?:aggregator|crawler|summarizer|reddit_scraper|twitter_scraper|youtube_scraper|github_scraper)\\.\\w+\\(",
+    r"\\b(?:aggregator|crawler|summarizer|reddit_scraper|twitter_scraper|youtube_scraper|github_scraper)\\.\\w+\\(\\""",
     src,
 )
 if remaining:
