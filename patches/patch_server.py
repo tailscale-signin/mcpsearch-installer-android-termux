@@ -14,36 +14,36 @@ src = src2
 if "get_research_agent()" in src and "import get_research_agent" not in src:
     src = re.sub(
         r"(^import .*$|^from .*$)",
-        r"\\1\\nfrom agents.research_agent import get_research_agent",
+        r"\1\nfrom agents.research_agent import get_research_agent",
         src, count=1, flags=re.MULTILINE,
     )
     notes.append("inserted missing get_research_agent import")
 
 # 2. Replace bare factory-object names with their get_X() calls.
-#    \\b already prevents matching inside get_crawler/get_summarizer/etc,
-#    since \'_\\\' and the following letter are both word chars (no boundary).
+#    Word-boundary regex prevents matching inside get_crawler/get_summarizer/etc,
+#    since underscore and the following letter are both word chars (no boundary).
 #    Import/from lines are skipped so `from crawler.engine import ...`
 #    is never touched.
 bare_names = ["aggregator", "crawler", "summarizer",
               "reddit_scraper", "twitter_scraper", "youtube_scraper", "github_scraper"]
-src_lines = src.split("\\n")
+src_lines = src.split("\n")
 for name in bare_names:
-    pattern = re.compile(r"\\b" + name + r"\\.")
+    pattern = re.compile(r"\b" + name + r"\.")
     replacement = f"get_{name}()."
     count = 0
     for i, line in enumerate(src_lines):
-        if re.match(r"^\\s*(from|import)\\s", line):
+        if re.match(r"^\s*(from|import)\s", line):
             continue
         new_line, n = pattern.subn(replacement, line)
         if n:
             src_lines[i] = new_line
             count += n
     if count:
-        notes.append(f"replaced {count}x bare \'{name}.\' -> \'get_{name}().\'")
-src = "\\n".join(src_lines)
+        notes.append(f"replaced {count}x bare '{name}.' -> 'get_{name}().'")
+src = "\n".join(src_lines)
 
 # 3. Fix zero-arg lines.append() -> lines.append("")
-new_src, n = re.subn(r\'lines\\.append\\(\)\', r\'lines.append("")\', src)
+new_src, n = re.subn(r'lines\.append\(\)', r'lines.append("")', src)
 if n:
     notes.append(f"fixed {n}x empty lines.append()")
 src = new_src
@@ -56,7 +56,7 @@ for n in notes:
     print(" -", n)
 
 remaining = re.findall(
-    r"\\b(?:aggregator|crawler|summarizer|reddit_scraper|twitter_scraper|youtube_scraper|github_scraper)\\.\\w+\\(\\""",
+    r"\b(?:aggregator|crawler|summarizer|reddit_scraper|twitter_scraper|youtube_scraper|github_scraper)\.\w+\(\""",
     src,
 )
 if remaining:
