@@ -61,6 +61,21 @@ Merge the contents of `mcp_client_snippet.json` into your MCP client's config (e
 
 Every phase writes to `~/.mcpsearch_logs/`. If the script exits with `fatal`, check the referenced log file first — most failures are native-dependency build issues that resolve after `pkg upgrade` or a Termux storage permission fix (`termux-setup-storage`).
 
+## Repository structure
+
+```
+.
+├── install_mcpsearch.sh   # The installer — clone, patch, install, self-test (run this)
+├── patches/                # Standalone reference copies of the patch logic embedded in the installer
+│   ├── patch_server.py     # Reference copy of the mcp_server/server.py patch step
+│   └── README.md            # Explains what patches/ is for and how it relates to the installer
+├── CHANGELOG.md            # Version history of the installer script
+├── LICENSE                 # MIT license
+└── README.md                # You are here
+```
+
+See [`patches/README.md`](patches/README.md) for details on why those reference copies exist and how to use them for manual troubleshooting.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
