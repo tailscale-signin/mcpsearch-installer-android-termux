@@ -1,35 +1,30 @@
 # patches/
 
-This directory contains a **standalone, reference copy** of the `mcp_server/server.py`
-patch logic that `install_mcpsearch.sh` applies inline during Phase 2.
+This directory contains standalone reference copies of the Python patch logic that `install_mcpsearch.sh` embeds and runs automatically during installation (Phase 2 of the installer).
+
+## Why this exists
+
+The main installer (`install_mcpsearch.sh`) generates and executes these patch scripts on-the-fly inside a Termux temp directory as part of its automated setup. The copies here are kept **for reference and manual troubleshooting only** — they let you:
+
+- Inspect exactly what code transformations are applied to the cloned `MCPSearch` source tree without having to read through the installer's embedded heredocs.
+- Re-run a specific patch step manually against a local checkout of `MCPSearch` if you need to debug a failed install without rerunning the entire installer.
+- Review changes to the patch logic in isolation via git history/diffs.
 
 ## Files
 
-- `patch_server.py` — regex-based patch for `~/MCPSearch/mcp_server/server.py`. Fixes:
-  - an undefined `get_research_agent_instance()` reference (renamed to `get_research_agent()`)
-  - bare factory-object calls (`crawler.`, `aggregator.`, `summarizer.`, and the
-    per-platform scrapers) that should go through their `get_x()` accessors instead
-  - zero-argument `lines.append()` calls (corrected to `lines.append("")`)
-  - the `investigate`, `compare`, and `trending` tool bodies, rebuilt to match the
-    actual data shape returned by the research agent / scrapers
+- **`patch_server.py`** — Patches `mcp_server/server.py` in a cloned `MCPSearch` checkout:
+  1. Fixes a stale `get_research_agent_instance()` call to the correct `get_research_agent()`, inserting the import if missing.
+  2. Rewrites bare factory-object references (e.g. `aggregator.`, `crawler.`, `summarizer.`, `reddit_scraper.`, `twitter_scraper.`, `youtube_scraper.`, `github_scraper.`) to their corresponding `get_X()` calls, skipping `import`/`from` lines so real imports are never touched.
+  3. Fixes zero-argument `lines.append()` calls to `lines.append("")`.
 
-## Do I need to run this manually?
+## Important note
 
-**No, not normally.** `install_mcpsearch.sh` embeds and runs this exact patch logic
-itself during Phase 2 — you don't need to touch this directory for a standard install.
+These files are **not imported or executed by `install_mcpsearch.sh`** — the installer contains its own embedded, self-contained versions of this logic (written to a temp file at install time). If you edit the installer's patch behavior, update **both** the embedded heredoc in `install_mcpsearch.sh` and the corresponding reference copy here to keep them in sync.
 
-This file exists for two reasons:
+To run this script manually against an existing `~/MCPSearch` checkout on Termux:
 
-1. **Reference** — so you can review exactly what gets changed in `server.py` without
-   digging it out of a bash heredoc inside `install_mcpsearch.sh`.
-2. **Manual re-application** — if you've already run the installer once, then pulled a
-   newer upstream `MCPSearch` commit into `~/MCPSearch` yourself (outside the
-   installer), and want to re-apply just this patch without re-running the whole
-   script:
+```bash
+python3 patches/patch_server.py
+```
 
-   ```bash
-   python3 patches/patch_server.py
-   ```
-
-The patch is idempotent — re-running it against an already-patched `server.py` is a
-safe no-op, since it only rewrites the exact broken patterns it's looking for.
+It is idempotent — safe to re-run without side effects if the target file is already patched.
