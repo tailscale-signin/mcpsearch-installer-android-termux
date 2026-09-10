@@ -19,24 +19,31 @@ This repository provides an unofficial, community-maintained Bash installer for 
 
 #### `README.md`
 - **Responsibility:** User-facing overview, motivation, requirements, installation instructions, troubleshooting guidance, and repository map.
-- **Key contents:** Documents the four installer phases, generated paths, patched upstream failures, and one-command installation flow.
+- **Key contents:** Documents the installer phases (0-5), generated paths, patched upstream failures, CLI flags (`--no-rust`), env vars (`MCPSEARCH_RUST_OPT`, `CARGO_BUILD_JOBS`), and one-command installation flow.
 - **Dependencies:** Describes `install_mcpsearch.sh`, `patches/`, `CHANGELOG.md`, and `LICENSE`; links to upstream MCPSearch.
 
 #### `install_mcpsearch.sh`
-- **Responsibility:** Main v1.2 Termux installer and test runner.
+- **Responsibility:** Main v1.7 Termux installer and test runner.
 - **Key functions:**
   - `step`, `ok`, `err`, `warn`, `fatal`: formatted status and failure reporting.
-  - `install_pkg`: three-tier Python dependency installation fallback.
+  - `spinner`, `pkg_progress`: animated single-line progress feedback for long-running `pkg` operations.
+  - `install_pkg`: package-aware, multi-tier Python dependency installation fallback.
 - **Major phases:**
-  1. Updates Termux and installs native build/runtime packages.
-  2. Clones or resets upstream MCPSearch; removes Playwright; adds `anysqlite`; patches `mcp_server/server.py` and `utils/http_client.py`; installs Python dependencies and the package.
-  3. Generates `~/.mcpsearch/run.sh` and `mcp_client_snippet.json`.
-  4. Imports the MCP server, exercises `get_crawl_stats()`, and verifies live `hishel` caching without deprecation warnings.
+  - **Phase 0:** Storage pre-flight check — warns early if free space on `$HOME` is low (native builds can need 2-4GB).
+  - **Phase 1:** Updates Termux and installs native build/runtime packages (Rust toolchain is optional via `--no-rust`).
+  - **Phase 2:** Clones or resets upstream MCPSearch; removes Playwright; adds `anysqlite`; patches `mcp_server/server.py` and `utils/http_client.py`; installs Python dependencies (package-aware tiers) and the package.
+  - **Phase 3:** Generates `~/.mcpsearch/run.sh` and `mcp_client_snippet.json`.
+  - **Phase 4:** Imports the MCP server, exercises `get_crawl_stats()`, and verifies live `hishel` caching without deprecation warnings.
+  - **Phase 5:** Post-install cleanup — purges pip cache, removes scratch tmp dir, and clears cargo registry cache to reclaim build space.
+- **Install tiers (`install_pkg`):**
+  1. Prebuilt wheel (`--no-cache-dir`).
+  2. Source build (`--no-binary :all:`).
+  3. Package-aware last resort: C-extension packages (`lxml`, `selectolax`) retry with `CFLAGS`/`LDFLAGS` pointing at Termux's `libxml2`/`libxslt`; everything else retries with Rust link flags derived from the live interpreter (`-lpython${PYVER}`), unless `--no-rust` is set.
 - **Dependencies:** Termux `pkg`; Bash utilities; `git`; Python/pip; Rust/Clang/native libraries; network access; upstream MCPSearch file layout and symbols; `httpbin.org` for the cache smoke test.
 
 #### `CHANGELOG.md`
 - **Responsibility:** Human-readable release history.
-- **Key contents:** v1.0 initial installer, v1.1 Termux/regex corrections, and v1.2 `hishel`/`anysqlite` cache fixes and tests.
+- **Key contents:** v1.0 initial installer, v1.1 Termux/regex corrections, v1.2 `hishel`/`anysqlite` cache fixes and tests, v1.3 visual progress feedback, v1.4 here-doc terminator fix, v1.5 self-integrity guard, v1.6 auto-detected Python version for the Rust link flag, and v1.7 storage & native-build hardening (package-aware tiers, memory-safe Rust builds, Phase 0 storage check, `--no-cache-dir`, Phase 5 cleanup, `--no-rust` flag).
 - **Dependencies:** Must track behavior and version changes in `install_mcpsearch.sh` and related reference patches.
 
 #### `LICENSE`
@@ -80,6 +87,9 @@ Reference-only copies of patch logic embedded in the installer. These files are 
 - Update this `AI-Memory.md` whenever repository files or established practices change.
 - Keep the installer version, header changelog, documentation, and release changelog aligned.
 - Preserve the MIT license and the unofficial/non-affiliation notice.
+- Keep native-build memory in check on constrained Android devices: cap `CARGO_BUILD_JOBS` and lower `-C opt-level` (via `MCPSEARCH_RUST_OPT`) to avoid Android's process killer (signal 9).
+- Use `--no-cache-dir` on pip installs and purge caches after install to avoid storage bloat on phones.
+- Remember that C-extension packages (e.g. `lxml`, `selectolax`) link against Termux's `libxml2`/`libxslt` and must NOT be sent through the Rust link-flag tier.
 
 ## Anti-Patterns & Traps (Don'ts)
 
@@ -93,6 +103,8 @@ Reference-only copies of patch logic embedded in the installer. These files are 
 - Do not omit `anysqlite` when using `hishel`'s async SQLite storage backend.
 - Do not pass deprecated `refresh_ttl_on_access` to `AsyncSqliteStorage`.
 - Do not assume scientific/native Python wheels are available in Termux; preserve tested fallback installation paths.
+- Do not send C-extension packages (`lxml`, `selectolax`) through the Rust link-flag tier — they need `libxml2`/`libxslt` CFLAGS/LDFLAGS instead.
+- Do not install the Rust toolchain when `--no-rust` is requested; Rust-based packages (e.g. `pydantic-core`) should then fail fast if no prebuilt wheel exists.
 - Do not edit only a reference patch or only its embedded installer copy when both represent the same transformation.
 - Do not assume reference scripts are valid merely because embedded versions pass; compile/test standalone files independently after edits.
 - Do not hardcode credentials, tokens, API keys, or private endpoints in scripts, generated configuration, tests, or documentation.
