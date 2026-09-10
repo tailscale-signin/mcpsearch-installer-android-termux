@@ -36,11 +36,32 @@ All patches are idempotent — safe to re-run the script against an existing ins
 
 ## Usage
 
+### Recommended: install via git clone
+
+Cloning with `git` is the most reliable way to get the full script — it avoids the silent truncation that `curl` can cause on flaky connections (which would stop the installer mid-Phase 2 and leave you without the launcher).
+
+```bash
+# 1. Make sure git is installed
+pkg update -y && pkg install -y git
+
+# 2. Clone the installer repo
+cd ~
+git clone https://github.com/tailscale-signin/mcpsearch-installer-android-termux.git
+cd mcpsearch-installer-android-termux
+
+# 3. Run the installer
+bash install_mcpsearch.sh
+```
+
+### Alternative: install via curl
+
 ```bash
 curl -fsSL -o ~/install_mcpsearch.sh https://raw.githubusercontent.com/tailscale-signin/mcpsearch-installer-android-termux/main/install_mcpsearch.sh
 chmod +x ~/install_mcpsearch.sh
 bash ~/install_mcpsearch.sh
 ```
+
+> If the curl download gets truncated (you'll see a `here-document ... delimited by end-of-file` warning and the script stops early), just re-download it or use the git clone method above.
 
 After a successful run, you'll have:
 
