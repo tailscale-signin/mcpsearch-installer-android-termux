@@ -1,10 +1,10 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # ============================================================================
-# MCPSearch Termux Bootstrap — one-command setup (v1.1)
+# MCPSearch Termux Bootstrap — one-command setup (v1.2)
 #
 # Does everything in a single run:
 #   1. Update package lists (pkg update)
-#   2. Upgrade installed packages (pkg upgrade)
+#   2. Upgrade installed packages safely (pkg upgrade + openssl sync to prevent curl breakage)
 #   3. Install git (and curl, for safety)
 #   4. Clone this installer repo
 #   5. Run install_mcpsearch.sh (passes through all CLI flags and options)
@@ -24,7 +24,7 @@
 # ============================================================================
 set -uo pipefail
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 REPO_URL="https://github.com/tailscale-signin/mcpsearch-installer-android-termux.git"
 INSTALLER_BRANCH="main"
 INSTALLER_DIR="$HOME/mcpsearch-installer-android-termux"
@@ -39,12 +39,16 @@ fatal(){ err "$*"; echo -e "${RED}Aborted.${NC}"; exit 1; }
 
 # Parse bootstrap-level flags before forwarding the rest to install_mcpsearch.sh
 FORWARD_ARGS=()
+SKIP_UPGRADE=0
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --installer-branch)
       INSTALLER_BRANCH="$2"; shift 2 ;;
     --installer-branch=*)
       INSTALLER_BRANCH="${1#*=}"; shift ;;
+    --skip-upgrade)
+      SKIP_UPGRADE=1
+      FORWARD_ARGS+=("$1"); shift ;;
     --bootstrap-version)
       echo "MCPSearch Termux Bootstrap v$VERSION"; exit 0 ;;
     *)
@@ -62,14 +66,30 @@ pkg update -y > "$LOG_DIR/bootstrap_pkg.log" 2>&1 \
   && ok "pkg update" || warn "pkg update had issues (see $LOG_DIR/bootstrap_pkg.log)"
 
 # ---------------------------------------------------------------- STEP 2
-step "Step 2: Upgrade installed packages (pkg upgrade)"
-pkg upgrade -y >> "$LOG_DIR/bootstrap_pkg.log" 2>&1 \
-  && ok "pkg upgrade" || warn "pkg upgrade had issues (see $LOG_DIR/bootstrap_pkg.log)"
+if [ "$SKIP_UPGRADE" -eq 1 ]; then
+  step "Step 2: Upgrade installed packages (skipped via --skip-upgrade)"
+else
+  step "Step 2: Upgrade installed packages (pkg upgrade)"
+  pkg upgrade -y >> "$LOG_DIR/bootstrap_pkg.log" 2>&1 \
+    && ok "pkg upgrade" || warn "pkg upgrade had issues (see $LOG_DIR/bootstrap_pkg.log)"
+fi
+
+# Ensure openssl and curl libraries are synchronized to avoid partial upgrade linker errors
+pkg install -y openssl >> "$LOG_DIR/bootstrap_pkg.log" 2>&1 || true
 
 # ---------------------------------------------------------------- STEP 3
 step "Step 3: Install git (and curl)"
 pkg install -y git curl >> "$LOG_DIR/bootstrap_pkg.log" 2>&1 \
   && ok "git + curl installed" || fatal "failed to install git/curl (see $LOG_DIR/bootstrap_pkg.log)"
+
+# Sanity check curl linkage after package install
+if ! curl --version >/dev/null 2>&1; then
+  warn "curl binary has library linkage mismatch; attempting apt repair"
+  apt update >> "$LOG_DIR/bootstrap_pkg.log" 2>&1 || true
+  apt --fix-broken install -y >> "$LOG_DIR/bootstrap_pkg.log" 2>&1 || true
+  apt install -y --reinstall openssl libcurl curl >> "$LOG_DIR/bootstrap_pkg.log" 2>&1 || true
+  curl --version >/dev/null 2>&1 || fatal "curl remains broken after repair attempts (see $LOG_DIR/bootstrap_pkg.log)"
+fi
 
 # ---------------------------------------------------------------- STEP 4
 step "Step 4: Clone the installer repo (branch: $INSTALLER_BRANCH)"
