@@ -13,24 +13,27 @@ Running MCPSearch straight from `pip install` on Termux hits several walls:
 - The `investigate`, `compare`, and `trending` tool handlers assume a data shape from the research agent/scrapers that doesn't match what's actually returned, causing `KeyError`/`AttributeError` mid-request.
 - `hishel`'s async SQLite cache backend requires the `anysqlite` package, which isn't declared as a dependency — so any cache-enabled HTTP call (including `search_and_summarize`) fails at client construction with an `ImportError`.
 - `utils/http_client.py` passes a `refresh_ttl_on_access` kwarg to `AsyncSqliteStorage` that is deprecated/no-op as of `hishel` 1.3.x, and now only emits a `UserWarning` on every client construction.
+- Native builds on a phone are storage- and memory-hungry: `pydantic-core` (Rust) and `lxml` (C) can need 2–4 GB and can be killed by Android's process killer on low-RAM devices.
 
 This script clones the upstream repo fresh, applies idempotent patches for all of the above, installs dependencies with a multi-tier fallback strategy (since Termux's `pip` wheel availability for scientific/native packages is inconsistent), and then runs two rounds of live self-tests to confirm the server actually works — not just that it imports.
 
 ## What it does (high level)
 
-1. **Phase 1 — Termux environment:** updates `pkg`, installs required native toolchain packages (`rust`, `clang`, `libxml2`, etc.), upgrades `pip`.
-2. **Phase 2 — Clone, patch, install:**
+1. **Phase 0 — Storage pre-flight:** warns early if free space on `$HOME` is low, before the heavy native builds start.
+2. **Phase 1 — Termux environment:** updates `pkg`, installs required native toolchain packages (`rust`, `clang`, `libxml2`, `libxslt`, `binutils`, etc.), upgrades `pip`.
+3. **Phase 2 — Clone, patch, install:**
    - Clones/updates the MCPSearch repo.
    - Strips Playwright (HTTP-only crawling mode — headless browsers aren't practical on Android).
    - Adds the missing `anysqlite` dependency to `pyproject.toml`.
    - Regex-patches `mcp_server/server.py`: fixes bare factory-object calls, a broken `get_research_agent_instance` reference, empty `lines.append()` calls, and rebuilds the `investigate`/`compare`/`trending` tool bodies to match the actual data shapes.
    - Regex-patches `utils/http_client.py` to remove the deprecated `refresh_ttl_on_access` kwarg.
-   - Installs Python dependencies with a 3-tier fallback (wheel → `--no-binary` → Rust-linked force-reinstall).
+   - Installs Python dependencies with a **package-aware** 3-tier fallback (wheel → `--no-binary` → C-lib or Rust link flags, depending on the package).
    - Editable-installs the MCPSearch package.
-3. **Phase 3 — Launcher & client config:** writes a `run.sh` launcher and an MCP client config JSON snippet you can merge into Claude Desktop / Cursor / etc.
-4. **Phase 4 — Self-tests:**
+4. **Phase 3 — Launcher & client config:** writes a `run.sh` launcher and an MCP client config JSON snippet you can merge into Claude Desktop / Cursor / etc.
+5. **Phase 4 — Self-tests:**
    - Imports the server module, enumerates registered tools, and calls `get_crawl_stats()` live.
    - **Phase 4b:** constructs a real cached HTTP client, makes two requests, and asserts the second one is served from cache (`hishel_from_cache=True`) with zero deprecation warnings (enforced via `warnings-as-errors`).
+6. **Phase 5 — Cleanup:** purges the pip cache, removes scratch files, and clears the cargo registry cache to reclaim build space.
 
 All patches are idempotent — safe to re-run the script against an existing install without duplicating changes.
 
@@ -63,6 +66,15 @@ bash ~/install_mcpsearch.sh
 
 > If the curl download gets truncated (you'll see a `here-document ... delimited by end-of-file` warning and the script stops early), just re-download it or use the git clone method above.
 
+### Optional flags
+
+- `--no-rust` — skip installing the Rust toolchain and the Rust-link fallback tier. Use this if you want prebuilt wheels only and a fast, clear failure if a Rust-built package (e.g. `pydantic-core`) has no wheel for your device.
+
+### Environment variables
+
+- `MCPSEARCH_RUST_OPT` — Rust optimization level for source builds (default `1` for low memory; set to `3` for a faster but heavier release build).
+- `CARGO_BUILD_JOBS` — Rust build parallelism (default `1` to avoid Android's process killer).
+
 After a successful run, you'll have:
 
 - `~/MCPSearch` — patched source tree
@@ -75,12 +87,14 @@ Merge the contents of `mcp_client_snippet.json` into your MCP client's config (e
 ## Requirements
 
 - Termux (F-Droid build recommended over the deprecated Play Store version)
-- ~1–2 GB free storage (native builds for `lxml`, `selectolax`, etc. can be heavy)
+- ~2–4 GB free storage (native builds for `pydantic-core`, `lxml`, `selectolax`, etc. can be heavy)
 - Internet access for `pkg`/`pip`/`git`
 
 ## Logs & troubleshooting
 
 Every phase writes to `~/.mcpsearch_logs/`. If the script exits with `fatal`, check the referenced log file first — most failures are native-dependency build issues that resolve after `pkg upgrade` or a Termux storage permission fix (`termux-setup-storage`).
+
+If a Rust build dies with a "signal 9" (or just vanishes), that's Android's process killer — the installer now caps Rust parallelism and optimization to avoid it. On Android 14+ you can also disable child process restrictions in Settings → Developer Options.
 
 ## Repository structure
 
