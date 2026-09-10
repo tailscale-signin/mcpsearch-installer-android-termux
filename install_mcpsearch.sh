@@ -1,6 +1,6 @@
 # !/data/data/com.termux/files/usr/bin/bash
 # ============================================================================
-# MCPSearch Termux Installer — Master Script (v1.5, all 4 phases)
+# MCPSearch Termux Installer — Master Script (v1.6, all 4 phases)
 #
 # Changelog:
 #  - v1.0: Initial 4-phase installer (clone, patch, install, self-test)
@@ -32,13 +32,18 @@
 #        found the terminator, read to end-of-file, and the script
 #        silently died mid-Phase 2 for every user (the "here-document
 #        ... delimited by end-of-file" warning). All three are fixed.
-#  - v1.5 (this version) — self-integrity guard:
+#  - v1.5 — self-integrity guard:
 #      * Added a check at startup that verifies this script file is
 #        complete (all here-doc closing delimiters present). If a user's
 #        download was truncated (interrupted git clone / curl), the old
 #        script would die mid-here-doc with a confusing "delimited by
 #        end-of-file" error. Now it fails fast with a clear message and
 #        re-download instructions instead.
+#  - v1.6 — auto-detect Python version for the Rust link flag:
+#      * The last-resort pip install tier hardcoded `-lpython3.11`, which
+#        broke on any other Python version (e.g. 3.14). The flag is now
+#        derived from the actual interpreter in use, so it resolves to
+#        -lpython3.14 on a 3.14 device and stays correct for everyone.
 # ============================================================================
 set -uo pipefail
 APP_DIR="$HOME/MCPSearch"
@@ -49,6 +54,9 @@ PY="python3"
 mkdir -p "$LOG_DIR" "$CFG_DIR"
 TMPDIR="$HOME/.mcpsearch_tmp"; mkdir -p "$TMPDIR"
 command -v python3 >/dev/null 2>&1 || PY="python"
+# Detect the real Python version (major.minor) so the Rust link flag below
+# matches the actual interpreter, e.g. -lpython3.14 on a 3.14 device.
+PYVER=$("$PY" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || echo "3.11")
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 step(){ echo -e "\n${CYAN}▶ $*${NC}"; }
@@ -108,7 +116,7 @@ pkg_progress() {
   printf "\r\033[K"
 }
 
-echo -e "${BOLD}${CYAN}== MCPSearch Termux Installer — Phases 1-4 (v1.5) ==${NC}"
+echo -e "${BOLD}${CYAN}== MCPSearch Termux Installer — Phases 1-4 (v1.6) ==${NC}"
 
 # ---------------------------------------------------------------- PHASE 1
 step "Phase 1: Termux packages"
@@ -408,8 +416,8 @@ install_pkg() {
   timeout 60 "$PY" -m pip install --quiet --break-system-packages "$pkg" >> "$LOG_DIR/p2_pip.log" 2>&1 && return 0
   warn "$pkg: wheel install failed, retrying --no-binary"
   timeout 180 "$PY" -m pip install --quiet --break-system-packages --no-binary :all: "$pkg" >> "$LOG_DIR/p2_pip.log" 2>&1 && return 0
-  warn "$pkg: retrying with rust link flags"
-  RUSTFLAGS="-C link-arg=-lpython3.11" timeout 240 "$PY" -m pip install --quiet --break-system-packages --force-reinstall "$pkg" >> "$LOG_DIR/p2_pip.log" 2>&1
+  warn "$pkg: retrying with rust link flags (python${PYVER})"
+  RUSTFLAGS="-C link-arg=-lpython${PYVER}" timeout 240 "$PY" -m pip install --quiet --break-system-packages --force-reinstall "$pkg" >> "$LOG_DIR/p2_pip.log" 2>&1
 }
 DEP_FAIL=0
 for pkg in pydantic pydantic-settings httpx beautifulsoup4 lxml selectolax mcp hishel anysqlite; do
