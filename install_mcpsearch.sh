@@ -1,6 +1,6 @@
 # !/data/data/com.termux/files/usr/bin/bash
 # ============================================================================
-# MCPSearch Termux Installer — Master Script (v1.3, all 4 phases)
+# MCPSearch Termux Installer — Master Script (v1.4, all 4 phases)
 #
 # Changelog:
 #  - v1.0: Initial 4-phase installer (clone, patch, install, self-test)
@@ -15,7 +15,7 @@
 #         kwarg from AsyncSqliteStorage(...) in utils/http_client.py.
 #      3. anysqlite + hishel added explicitly to the pip install tier list.
 #      4. Phase 4 self-test extended with an HTTP-cache smoke test.
-#  - v1.3 (this version) — visual feedback for Phase 1:
+#  - v1.3: visual feedback for Phase 1:
 #      * Added an animated spinner + live progress percentage while
 #        `pkg update` and `pkg upgrade` run (previously output was hidden
 #        into a log file, so the script looked frozen for many minutes).
@@ -24,6 +24,14 @@
 #        installed and how far along the phase is.
 #      * All progress is drawn on a single line with \r so it stays tidy;
 #        full logs are still written to $LOG_DIR for troubleshooting.
+#  - v1.4 (this version) — CRITICAL here-doc fix:
+#      * Three here-docs (the http_client.py patch, the run.sh launcher,
+#        and the MCP client JSON snippet) had their CLOSING delimiters
+#        written WITH quotes ('PYEOF', 'LAUNCHER_EOF', 'JSONEOF').
+#        A closing here-doc delimiter must be unquoted, so bash never
+#        found the terminator, read to end-of-file, and the script
+#        silently died mid-Phase 2 for every user (the "here-document
+#        ... delimited by end-of-file" warning). All three are fixed.
 # ============================================================================
 set -uo pipefail
 APP_DIR="$HOME/MCPSearch"
@@ -75,7 +83,7 @@ pkg_progress() {
   printf "\r\033[K"
 }
 
-echo -e "${BOLD}${CYAN}== MCPSearch Termux Installer — Phases 1-4 (v1.3) ==${NC}"
+echo -e "${BOLD}${CYAN}== MCPSearch Termux Installer — Phases 1-4 (v1.4) ==${NC}"
 
 # ---------------------------------------------------------------- PHASE 1
 step "Phase 1: Termux packages"
@@ -362,7 +370,7 @@ else:
     else:
         print("NOOP: no deprecated refresh_ttl_on_access kwarg found (already clean or never present)")
 print("VERIFY_OK: http_client.py patch script completed")
-'PYEOF'
+PYEOF
 "$PY" "$TMPDIR/mcpsearch_patch_httpclient.py" 2>&1 | tee "$LOG_DIR/p2_patch_httpclient.log"
 grep -q "VERIFY_OK" "$LOG_DIR/p2_patch_httpclient.log" || fatal "http_client.py patch verification failed, see "$LOG_DIR/p2_patch_httpclient.log""
 "$PY" -m py_compile "$APP_DIR/utils/http_client.py" 2>>"$LOG_DIR/p2_patch_httpclient.log" \
@@ -394,7 +402,7 @@ cat > "$CFG_DIR/run.sh" << 'LAUNCHER_EOF'
 #!/data/data/com.termux/files/usr/bin/bash
 cd "$APP_DIR" || exit 1
 exec $PY -m mcp_server
-'LAUNCHER_EOF'
+LAUNCHER_EOF
 chmod +x "$CFG_DIR/run.sh"
 ok "launcher written to "$CFG_DIR/run.sh""
 
@@ -407,7 +415,7 @@ cat > "$CFG_DIR/mcp_client_snippet.json" << 'JSONEOF'
     }
   }
 }
-'JSONEOF'
+JSONEOF
 ok "MCP client config snippet written to "$CFG_DIR/mcp_client_snippet.json""
 warn "This is a stdio MCP server: it is meant to be launched by an MCP client (e.g. Claude Desktop, Cursor), not run standalone as a network daemon. Merge the snippet above into your client's config file."
 
