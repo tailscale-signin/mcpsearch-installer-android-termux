@@ -1,32 +1,29 @@
 # !/data/data/com.termux/files/usr/bin/bash
 # ============================================================================
-# MCPSearch Termux Installer — Master Script (v1.2, all 4 phases)
+# MCPSearch Termux Installer — Master Script (v1.3, all 4 phases)
 #
 # Changelog:
 #  - v1.0: Initial 4-phase installer (clone, patch, install, self-test)
 #  - v1.1: Termux /tmp sandbox fix, line-aware regex patch (skip import
 #          lines), full multi-line function signature capture fix.
-#  - v1.2 (this version) — hishel async-cache fixes, verified end-to-end:
+#  - v1.2: hishel async-cache fixes, verified end-to-end:
 #      1. Added missing `anysqlite` dependency to pyproject.toml.
 #         hishel[httpx]'s AsyncSqliteStorage requires anysqlite but it was
 #         never declared, causing ImportError at cache-client construction
 #         time inside search_and_summarize / any cached HTTP call.
 #      2. Removed deprecated `refresh_ttl_on_access=config.refresh_on_hit`
 #         kwarg from AsyncSqliteStorage(...) in utils/http_client.py.
-#         This parameter is a no-op as of hishel 1.3.x and only emits a
-#         UserWarning on every client construction; patch is done via
-#         idempotent regex (safe to re-run, no-op if already patched).
-#      3. anysqlite + hishel added explicitly to the pip install tier list
-#         (previously only implied via editable install, which could lag
-#         or fail silently on constrained Termux environments).
-#      4. Phase 4 self-test extended with an HTTP-cache smoke test that
-#         exercises build_async_client() under both the default RFC 9111
-#         SpecificationPolicy and always_cache=True (FilterPolicy) paths,
-#         asserting the correct hishel_from_cache extension behavior and
-#         asserting NO UserWarning is raised (via warnings-as-errors).
-#  - Verified: Phase 4 self-test passes — server imports cleanly, responds
-#    to a live get_crawl_stats() tool call, and the HTTP cache layer is
-#    confirmed functional with no deprecation warnings.
+#      3. anysqlite + hishel added explicitly to the pip install tier list.
+#      4. Phase 4 self-test extended with an HTTP-cache smoke test.
+#  - v1.3 (this version) — visual feedback for Phase 1:
+#      * Added an animated spinner + live progress percentage while
+#        `pkg update` and `pkg upgrade` run (previously output was hidden
+#        into a log file, so the script looked frozen for many minutes).
+#      * Added a per-package progress bar (X/Y, %) during the package
+#        install loop so users can see exactly which package is being
+#        installed and how far along the phase is.
+#      * All progress is drawn on a single line with \r so it stays tidy;
+#        full logs are still written to $LOG_DIR for troubleshooting.
 # ============================================================================
 set -uo pipefail
 APP_DIR="$HOME/MCPSearch"
@@ -45,14 +42,63 @@ err(){ echo -e "  ${RED}✘${NC} $*"; }
 warn(){ echo -e "  ${YELLOW}⚠${NC} $*"; }
 fatal(){ err "$*"; echo -e "${RED}Aborted. Logs: $LOG_DIR${NC}"; exit 1; }
 
-echo -e "${BOLD}${CYAN}== MCPSearch Termux Installer — Phases 1-4 (v1.2) ==${NC}"
+# Animated spinner + message while a background command ($1 = pid) runs.
+# Draws on a single line with \r and clears it when done.
+SPIN=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+spinner() {
+  local pid="$1" msg="$2" i=0
+  while kill -0 "$pid" 2>/dev/null; do
+    printf "\r  ${CYAN}%s${NC} %s ..." "${SPIN[$((i % ${#SPIN[@]}))]}" "$msg"
+    i=$((i + 1))
+    sleep 0.1
+  done
+  printf "\r\033[K"
+}
+
+# Per-package progress bar: shows X/Y and a filled bar while a package
+# installs. $1=current, $2=total, $3=package name, $4=pid to watch.
+pkg_progress() {
+  local cur="$1" total="$2" name="$3" pid="$4" i=0 width=24
+  while kill -0 "$pid" 2>/dev/null; do
+    local pct=$((cur * 100 / total))
+    local filled=$((cur * width / total))
+    local bar=""
+    local j
+    for ((j = 0; j < width; j++)); do
+      if [ "$j" -lt "$filled" ]; then bar="${bar}█"; else bar="${bar}░"; fi
+    done
+    printf "\r  ${CYAN}%s${NC} installing %-12s ${CYAN}[%s]${NC} %3d%% (%d/%d) ..." \
+      "${SPIN[$((i % ${#SPIN[@]}))]}" "$name" "$bar" "$pct" "$cur" "$total"
+    i=$((i + 1))
+    sleep 0.1
+  done
+  printf "\r\033[K"
+}
+
+echo -e "${BOLD}${CYAN}== MCPSearch Termux Installer — Phases 1-4 (v1.3) ==${NC}"
 
 # ---------------------------------------------------------------- PHASE 1
 step "Phase 1: Termux packages"
-pkg update -y > "$LOG_DIR/p1.log" 2>&1 || warn "pkg update had issues"
-pkg upgrade -y >> "$LOG_DIR/p1.log" 2>&1 || warn "pkg upgrade had issues"
-for p in python git rust binutils libjpeg-turbo libxml2 libxslt clang make pkg-config openssl patchelf curl; do
-  pkg install -y "$p" >> "$LOG_DIR/p1.log" 2>&1 && ok "$p" || fatal "failed to install $p (see $LOG_DIR/p1.log)"
+pkg update -y > "$LOG_DIR/p1.log" 2>&1 &
+_PID=$!
+spinner "$_PID" "pkg update"
+if wait "$_PID"; then ok "pkg update"; else warn "pkg update had issues"; fi
+
+pkg upgrade -y >> "$LOG_DIR/p1.log" 2>&1 &
+_PID=$!
+spinner "$_PID" "pkg upgrade (this can take a while)"
+if wait "$_PID"; then ok "pkg upgrade"; else warn "pkg upgrade had issues"; fi
+
+PKGS="python git rust binutils libjpeg-turbo libxml2 libxslt clang make pkg-config openssl patchelf curl"
+set -- $PKGS
+TOTAL=$#
+CUR=0
+for p in $PKGS; do
+  CUR=$((CUR + 1))
+  pkg install -y "$p" >> "$LOG_DIR/p1.log" 2>&1 &
+  _PID=$!
+  pkg_progress "$CUR" "$TOTAL" "$p" "$_PID"
+  if wait "$_PID"; then ok "$p"; else fatal "failed to install $p (see $LOG_DIR/p1.log)"; fi
 done
 "$PY" -m ensurepip --upgrade > "$LOG_DIR/p1_pip.log" 2>&1 || true
 "$PY" -m pip install --upgrade pip --break-system-packages >> "$LOG_DIR/p1_pip.log" 2>&1 || warn "pip upgrade had issues"
@@ -144,7 +190,7 @@ src = new_src
 # 4. Rebuild investigate()/compare()/trending() bodies.
 def replace_function(src, func_name, new_body_source, notes):
     pattern = re.compile(
-        r"(async def " + func_name + r"\(.*?-> str:\n)(.*?)(?=\n@mcp\\.tool\(|\Z)",
+        r"(async def " + func_name + r"\(.*?-> str:\n)(.*?)(?=\n@mcp\.tool\(|\Z)",
         re.DOTALL,
     )
     m = pattern.search(src)
