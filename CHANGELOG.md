@@ -2,6 +2,22 @@
 
 All notable changes to this installer are documented here.
 
+## v1.9.0
+
+**Focus: performance & non-interactive execution reliability**
+
+- **Non-interactive Dpkg environment:** Enforces `DEBIAN_FRONTEND=noninteractive` and `-o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold` across all package operations. Prevents background installer subshells from freezing or crashing when apt encounters config file prompts on Android Termux.
+- **Batch package detection & installation:** Replaced the slow sequential loop (12 separate `pkg install` runs) with a fast `dpkg -s` check that only installs missing packages in a single batch. Saves 3–5 minutes of package manager overhead.
+- **Native `python-lxml` package integration:** Pre-installs Termux's native `python-lxml` binary if available, avoiding 5–10 minutes of compiling `lxml` from source on low-power mobile ARM processors.
+- **Bandwidth and I/O optimization:** Converted git operations to use shallow clones (`git clone --depth 1 --single-branch`) and shallow fetches (`git fetch --depth 1`), dramatically speeding up source tree synchronization on mobile storage.
+- **Fast-path pip wheel resolution:** Attempts a single batch wheel install for standard Python dependencies first, and falls back to custom C-lib and Rust link flags only if needed.
+
+## v1.8.1
+
+- Fixed critical launcher expansion bug (unquoted heredocs for run.sh and mcp_client_snippet.json).
+- Fixed CLI option shifting bug (spurious unknown-option warnings).
+- Restricts `--check` to self-tests and makes `--dry-run` zero-side-effect.
+
 ## v1.7
 
 **Focus: storage & native-build hardening**
