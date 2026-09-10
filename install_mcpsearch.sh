@@ -1,6 +1,6 @@
 # !/data/data/com.termux/files/usr/bin/bash
 # ============================================================================
-# MCPSearch Termux Installer — Master Script (v1.4, all 4 phases)
+# MCPSearch Termux Installer — Master Script (v1.5, all 4 phases)
 #
 # Changelog:
 #  - v1.0: Initial 4-phase installer (clone, patch, install, self-test)
@@ -24,7 +24,7 @@
 #        installed and how far along the phase is.
 #      * All progress is drawn on a single line with \r so it stays tidy;
 #        full logs are still written to $LOG_DIR for troubleshooting.
-#  - v1.4 (this version) — CRITICAL here-doc fix:
+#  - v1.4 — CRITICAL here-doc fix:
 #      * Three here-docs (the http_client.py patch, the run.sh launcher,
 #        and the MCP client JSON snippet) had their CLOSING delimiters
 #        written WITH quotes ('PYEOF', 'LAUNCHER_EOF', 'JSONEOF').
@@ -32,6 +32,13 @@
 #        found the terminator, read to end-of-file, and the script
 #        silently died mid-Phase 2 for every user (the "here-document
 #        ... delimited by end-of-file" warning). All three are fixed.
+#  - v1.5 (this version) — self-integrity guard:
+#      * Added a check at startup that verifies this script file is
+#        complete (all here-doc closing delimiters present). If a user's
+#        download was truncated (interrupted git clone / curl), the old
+#        script would die mid-here-doc with a confusing "delimited by
+#        end-of-file" error. Now it fails fast with a clear message and
+#        re-download instructions instead.
 # ============================================================================
 set -uo pipefail
 APP_DIR="$HOME/MCPSearch"
@@ -49,6 +56,24 @@ ok(){ echo -e "  ${GREEN}✔${NC} $*"; }
 err(){ echo -e "  ${RED}✘${NC} $*"; }
 warn(){ echo -e "  ${YELLOW}⚠${NC} $*"; }
 fatal(){ err "$*"; echo -e "${RED}Aborted. Logs: $LOG_DIR${NC}"; exit 1; }
+
+# ---------------------------------------------------------------------------
+# Self-integrity check: verify this script file is complete (not truncated).
+# A truncated download (e.g. interrupted git clone / curl) would otherwise
+# die mid-here-doc with a confusing "here-document ... delimited by
+# end-of-file" error. Each closing here-doc delimiter must appear alone on
+# its own line; if any is missing, the file was cut off. Fail fast instead.
+# ---------------------------------------------------------------------------
+_SELF="$0"
+for _delim in PYEOF LAUNCHER_EOF JSONEOF TESTEOF CACHETESTEOF; do
+  if ! grep -q "^${_delim}$" "$_SELF"; then
+    echo -e "${RED}✘ This installer file appears truncated (missing here-doc terminator '${_delim}').${NC}"
+    echo -e "${RED}  The download was incomplete. Please re-download it fully, e.g.:${NC}"
+    echo -e "${YELLOW}  cd ~ && rm -rf mcpsearch-installer-android-termux && git clone https://github.com/tailscale-signin/mcpsearch-installer-android-termux.git && cd mcpsearch-installer-android-termux && bash install_mcpsearch.sh${NC}"
+    exit 1
+  fi
+done
+unset _SELF _delim
 
 # Animated spinner + message while a background command ($1 = pid) runs.
 # Draws on a single line with \r and clears it when done.
@@ -83,7 +108,7 @@ pkg_progress() {
   printf "\r\033[K"
 }
 
-echo -e "${BOLD}${CYAN}== MCPSearch Termux Installer — Phases 1-4 (v1.4) ==${NC}"
+echo -e "${BOLD}${CYAN}== MCPSearch Termux Installer — Phases 1-4 (v1.5) ==${NC}"
 
 # ---------------------------------------------------------------- PHASE 1
 step "Phase 1: Termux packages"
