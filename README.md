@@ -1,6 +1,6 @@
 # MCPSearch Installer for Android Termux
 
-A hardened, self-testing bash installer that gets [MCPSearch](https://github.com/JonusNattapong/MCPSearch) running correctly inside **Termux on Android** as a stdio MCP server — patching several upstream bugs and Termux-specific sandbox issues along the way, then verifying the result with live smoke tests before declaring success.
+A hardened, self-testing bash installer and curl bootstrap that gets [MCPSearch](https://github.com/JonusNattapong/MCPSearch) running correctly inside **Termux on Android** as a stdio MCP server — patching several upstream bugs and Termux-specific sandbox issues along the way, then verifying the result with live smoke tests before declaring success.
 
 > This is an unofficial, community installer/patch script. It is not affiliated with the MCPSearch project maintainers.
 
@@ -29,7 +29,7 @@ This script clones the upstream repo fresh, applies idempotent patches for all o
    - Regex-patches `utils/http_client.py` to remove the deprecated `refresh_ttl_on_access` kwarg.
    - Installs Python dependencies with a **package-aware** 3-tier fallback (wheel → `--no-binary` → C-lib or Rust link flags, depending on the package).
    - Editable-installs the MCPSearch package.
-4. **Phase 3 — Launcher & client config:** writes a `run.sh` launcher and an MCP client config JSON snippet you can merge into Claude Desktop / Cursor / etc.
+4. **Phase 3 — Launcher & client config:** writes a `run.sh` launcher and an MCP client config JSON snippet with concrete absolute paths you can merge into Claude Desktop / Cursor / etc.
 5. **Phase 4 — Self-tests:**
    - Imports the server module, enumerates registered tools, and calls `get_crawl_stats()` live.
    - **Phase 4b:** constructs a real cached HTTP client, makes two requests, and asserts the second one is served from cache (`hishel_from_cache=True`) with zero deprecation warnings (enforced via `warnings-as-errors`).
@@ -39,9 +39,25 @@ All patches are idempotent — safe to re-run the script against an existing ins
 
 ## Usage
 
+### Quickest: one-line curl bootstrap
+
+The curl bootstrap (`bootstrap.sh`) downloads the installer safely into a temporary file, verifies its integrity, and runs it with whichever flags you specify:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/tailscale-signin/mcpsearch-installer-android-termux/main/bootstrap.sh | bash
+```
+
+Pass flags through directly to the installer:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/tailscale-signin/mcpsearch-installer-android-termux/main/bootstrap.sh | bash -s -- --dry-run
+curl -fsSL https://raw.githubusercontent.com/tailscale-signin/mcpsearch-installer-android-termux/main/bootstrap.sh | bash -s -- --check
+curl -fsSL https://raw.githubusercontent.com/tailscale-signin/mcpsearch-installer-android-termux/main/bootstrap.sh | bash -s -- --no-rust
+```
+
 ### Recommended: install via git clone
 
-Cloning with `git` is the most reliable way to get the full script — it avoids the silent truncation that `curl` can cause on flaky connections (which would stop the installer mid-Phase 2 and leave you without the launcher).
+Cloning with `git` is the most reliable way to get the full script — it avoids any connection drops:
 
 ```bash
 # 1. Make sure git is installed
@@ -56,19 +72,22 @@ cd mcpsearch-installer-android-termux
 bash install_mcpsearch.sh
 ```
 
-### Alternative: install via curl
+### Installer CLI options
 
-```bash
-curl -fsSL -o ~/install_mcpsearch.sh https://raw.githubusercontent.com/tailscale-signin/mcpsearch-installer-android-termux/main/install_mcpsearch.sh
-chmod +x ~/install_mcpsearch.sh
-bash ~/install_mcpsearch.sh
-```
+Run `bash install_mcpsearch.sh --help` for the complete list:
 
-> If the curl download gets truncated (you'll see a `here-document ... delimited by end-of-file` warning and the script stops early), just re-download it or use the git clone method above.
-
-### Optional flags
-
-- `--no-rust` — skip installing the Rust toolchain and the Rust-link fallback tier. Use this if you want prebuilt wheels only and a fast, clear failure if a Rust-built package (e.g. `pydantic-core`) has no wheel for your device.
+| Option | Description |
+|---|---|
+| `--help`, `-h` | Display help screen and exit |
+| `--version`, `-V` | Show installer version and exit |
+| `--dry-run`, `-n` | Print detected environment and execution plan without making any changes (zero-side-effect) |
+| `--check` | Run Phase 4 self-tests only against existing installation without modifying anything |
+| `--no-rust` | Skip installing the Rust toolchain; fail fast if any Rust wheel is missing |
+| `--no-color` | Disable ANSI colored terminal output |
+| `--app-dir PATH` | Custom target directory for MCPSearch clone (default: `~/MCPSearch`) |
+| `--config-dir PATH` | Custom directory for `run.sh` and config snippet (default: `~/.mcpsearch`) |
+| `--log-dir PATH` | Custom directory for phase logs (default: `~/.mcpsearch_logs`) |
+| `--cache-test-url URL` | Custom URL for the Phase 4b HTTP cache smoke test (default: `https://httpbin.org/get`) |
 
 ### Environment variables
 
@@ -78,8 +97,8 @@ bash ~/install_mcpsearch.sh
 After a successful run, you'll have:
 
 - `~/MCPSearch` — patched source tree
-- `~/.mcpsearch/run.sh` — launcher script
-- `~/.mcpsearch/mcp_client_snippet.json` — config to merge into your MCP client
+- `~/.mcpsearch/run.sh` — launcher script (with absolute interpreter and app paths expanded)
+- `~/.mcpsearch/mcp_client_snippet.json` — config snippet ready to merge into your MCP client
 - `~/.mcpsearch_logs/` — full logs for every phase, useful for debugging if something fails
 
 Merge the contents of `mcp_client_snippet.json` into your MCP client's config (e.g. `claude_desktop_config.json`), then restart the client.
@@ -94,13 +113,14 @@ Merge the contents of `mcp_client_snippet.json` into your MCP client's config (e
 
 Every phase writes to `~/.mcpsearch_logs/`. If the script exits with `fatal`, check the referenced log file first — most failures are native-dependency build issues that resolve after `pkg upgrade` or a Termux storage permission fix (`termux-setup-storage`).
 
-If a Rust build dies with a "signal 9" (or just vanishes), that's Android's process killer — the installer now caps Rust parallelism and optimization to avoid it. On Android 14+ you can also disable child process restrictions in Settings → Developer Options.
+If a Rust build dies with a "signal 9" (or just vanishes), that's Android's process killer — the installer caps Rust parallelism and optimization to avoid it. On Android 14+ you can also disable child process restrictions in Settings → Developer Options.
 
 ## Repository structure
 
 ```
 .
-├── install_mcpsearch.sh   # The installer — clone, patch, install, self-test (run this)
+├── bootstrap.sh           # Safe curl-to-bash bootstrap entry point (run via curl | bash)
+├── install_mcpsearch.sh   # The core installer — clone, patch, install, self-test (v1.8.1)
 ├── patches/                # Standalone reference copies of the patch logic embedded in the installer
 │   ├── patch_server.py     # Reference copy of the mcp_server/server.py patch step
 │   └── README.md            # Explains what patches/ is for and how it relates to the installer
