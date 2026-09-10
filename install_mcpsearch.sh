@@ -1,114 +1,302 @@
-# !/data/data/com.termux/files/usr/bin/bash
+#!/data/data/com.termux/files/usr/bin/bash
 # ============================================================================
-# MCPSearch Termux Installer — Master Script (v1.7, all 4 phases + cleanup)
+# MCPSearch Termux Installer — Master Script (v1.8, all 4 phases + cleanup)
 #
 # Changelog:
 #  - v1.0: Initial 4-phase installer (clone, patch, install, self-test)
 #  - v1.1: Termux /tmp sandbox fix, line-aware regex patch (skip import
 #          lines), full multi-line function signature capture fix.
-#  - v1.2: hishel async-cache fixes, verified end-to-end:
-#      1. Added missing `anysqlite` dependency to pyproject.toml.
-#         hishel[httpx]'s AsyncSqliteStorage requires anysqlite but it was
-#         never declared, causing ImportError at cache-client construction
-#         time inside search_and_summarize / any cached HTTP call.
-#      2. Removed deprecated `refresh_ttl_on_access=config.refresh_on_hit`
-#         kwarg from AsyncSqliteStorage(...) in utils/http_client.py.
-#      3. anysqlite + hishel added explicitly to the pip install tier list.
-#      4. Phase 4 self-test extended with an HTTP-cache smoke test.
-#  - v1.3: visual feedback for Phase 1:
-#      * Added an animated spinner + live progress percentage while
-#        `pkg update` and `pkg upgrade` run (previously output was hidden
-#        into a log file, so the script looked frozen for many minutes).
-#      * Added a per-package progress bar (X/Y, %) during the package
-#        install loop so users can see exactly which package is being
-#        installed and how far along the phase is.
-#      * All progress is drawn on a single line with \r so it stays tidy;
-#        full logs are still written to $LOG_DIR for troubleshooting.
-#  - v1.4 — CRITICAL here-doc fix:
-#      * Three here-docs (the http_client.py patch, the run.sh launcher,
-#        and the MCP client JSON snippet) had their CLOSING delimiters
-#        written WITH quotes ('PYEOF', 'LAUNCHER_EOF', 'JSONEOF').
-#        A closing here-doc delimiter must be unquoted, so bash never
-#        found the terminator, read to end-of-file, and the script
-#        silently died mid-Phase 2 for every user (the "here-document
-#        ... delimited by end-of-file" warning). All three are fixed.
-#  - v1.5 — self-integrity guard:
-#      * Added a check at startup that verifies this script file is
-#        complete (all here-doc closing delimiters present). If a user's
-#        download was truncated (interrupted git clone / curl), the old
-#        script would die mid-here-doc with a confusing "delimited by
-#        end-of-file" error. Now it fails fast with a clear message and
-#        re-download instructions instead.
-#  - v1.6 — auto-detect Python version for the Rust link flag:
-#      * The last-resort pip install tier hardcoded `-lpython3.11`, which
-#        broke on any other Python version (e.g. 3.14). The flag is now
-#        derived from the actual interpreter in use, so it resolves to
-#        -lpython3.14 on a 3.14 device and stays correct for everyone.
-#  - v1.7 — storage & native-build hardening:
-#      * Package-aware install tiers: C-extension packages (lxml,
-#        selectolax) now retry with CFLAGS/LDFLAGS pointing at Termux's
-#        libxml2/libxslt instead of the meaningless Rust link flag. This
-#        fixes the "lxml: retrying with rust link flags" dead-end.
-#      * Memory-safe Rust builds: CARGO_BUILD_JOBS=1 and -C opt-level=1
-#        (configurable via MCPSEARCH_RUST_OPT) prevent Android's process
-#        killer (signal 9) from terminating cargo/rustc on low-RAM phones.
-#      * Storage pre-flight check (Phase 0) warns early if free space is low.
-#      * --no-cache-dir on every pip install to stop pip's download cache
-#        from eating GBs of storage.
-#      * New Phase 5 cleanup: purges pip cache, removes scratch tmp dir,
-#        and clears cargo registry cache to reclaim build space.
-#      * Optional --no-rust flag: skips installing the Rust toolchain and
-#        the Rust-link fallback tier (for users who want prebuilt wheels
-#        only and a fast fail if one is missing).
+#  - v1.2: hishel async-cache fixes, verified end-to-end.
+#  - v1.3: visual feedback for Phase 1 (spinner + per-package progress bar).
+#  - v1.4: CRITICAL here-doc terminator fix (unquoted closing delimiters).
+#  - v1.5: self-integrity guard against truncated downloads.
+#  - v1.6: auto-detect Python version for the Rust link flag.
+#  - v1.7: storage & native-build hardening (package-aware tiers, memory-safe
+#          Rust builds, Phase 0 storage check, --no-cache-dir, Phase 5
+#          cleanup, --no-rust flag).
+#  - v1.8: full CLI surface & runtime ergonomics:
+#      * New modes: --help, --version, --dry-run, --check, --uninstall,
+#        --purge.
+#      * New flags: --skip-upgrade, --keep-tmp, --no-cache-test,
+#        --force-reinstall, --verbose, --no-color, --yes, --no-progress,
+#        --no-fail-fast, --log-level.
+#      * Configurable paths/env: --branch, --repo-url, --prefix, --python,
+#        --app-dir, --log-dir, --config-dir, --tmp-dir.
+#      * Tuning: --timeout, --jobs, --opt-level.
+#      * Sub-step skips: --no-pkg, --no-update, --no-clone, --no-patch,
+#        --no-strip-playwright, --no-anysqlite, --no-editable,
+#        --no-ensurepip, --no-pip-upgrade, --no-selftest, --no-cleanup,
+#        --no-verify.
+#      * Cache-test overrides: --cache-test-url, --cache-test-timeout,
+#        --cache-test-retries, --cache-test-backoff, --cache-test-interval,
+#        --no-httpbin.
 # ============================================================================
 set -uo pipefail
-APP_DIR="$HOME/MCPSearch"
-LOG_DIR="$HOME/.mcpsearch_logs"
-CFG_DIR="$HOME/.mcpsearch"
-REPO_URL="https://github.com/JonusNattapong/MCPSearch"
-PY="python3"
-mkdir -p "$LOG_DIR" "$CFG_DIR"
-TMPDIR="$HOME/.mcpsearch_tmp"; mkdir -p "$TMPDIR"
-command -v python3 >/dev/null 2>&1 || PY="python"
-# Detect the real Python version (major.minor) so the Rust link flag below
-# matches the actual interpreter, e.g. -lpython3.14 on a 3.14 device.
-PYVER=$("$PY" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || echo "3.11")
-# Termux prefix (where libxml2/libxslt headers live). Usually already set.
+
+VERSION="1.8.0"
+
+# --- Configurable paths/env (env-overridable, then flags) ------------------
+APP_DIR="${MCPSEARCH_APP_DIR:-$HOME/MCPSearch}"
+LOG_DIR="${MCPSEARCH_LOG_DIR:-$HOME/.mcpsearch_logs}"
+CFG_DIR="${MCPSEARCH_CONFIG_DIR:-$HOME/.mcpsearch}"
+TMPDIR="${MCPSEARCH_TMP_DIR:-$HOME/.mcpsearch_tmp}"
+REPO_URL="${MCPSEARCH_REPO_URL:-https://github.com/JonusNattapong/MCPSearch}"
+BRANCH="${MCPSEARCH_BRANCH:-main}"
+PY="${MCPSEARCH_PYTHON:-python3}"
 PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
 
-# --- CLI flags -------------------------------------------------------------
+# --- Behavior defaults -----------------------------------------------------
+SKIP_UPGRADE=0
+KEEP_TMP=0
+NO_CACHE_TEST=0
+FORCE_REINSTALL=0
+VERBOSE=0
+DRY_RUN=0
+CHECK_ONLY=0
+UNINSTALL=0
+PURGE=0
 NO_RUST=0
-for _arg in "$@"; do
-  case "$_arg" in
-    --no-rust) NO_RUST=1 ;;
-    *) ;;
+NO_COLOR=0
+YES=0
+NO_PROGRESS=0
+NO_FAIL_FAST=0
+LOG_LEVEL="info"
+
+# Tuning defaults
+TIMEOUT=60
+JOBS="${CARGO_BUILD_JOBS:-1}"
+OPT_LEVEL="${MCPSEARCH_RUST_OPT:-1}"
+
+# Sub-step skip toggles
+NO_PKG=0
+NO_UPDATE=0
+NO_CLONE=0
+NO_PATCH=0
+NO_STRIP_PLAYWRIGHT=0
+NO_ANYSLITE=0
+NO_EDITABLE=0
+NO_ENSUREPIP=0
+NO_PIP_UPGRADE=0
+NO_SELFTEST=0
+NO_CLEANUP=0
+NO_VERIFY=0
+
+# Cache-test overrides
+CACHE_TEST_URL="https://httpbin.org/get"
+CACHE_TEST_TIMEOUT=30
+CACHE_TEST_RETRIES=2
+CACHE_TEST_BACKOFF=1.0
+CACHE_TEST_INTERVAL=0.0
+NO_HTTPBIN=0
+
+# --- CLI argument parsing --------------------------------------------------
+usage() {
+  cat << 'HELPEOF'
+MCPSearch Termux Installer (v1.8)
+
+Usage:
+  bash install_mcpsearch.sh [options]
+
+Modes:
+  --help               Show this help and exit.
+  --version            Print version and exit.
+  --dry-run            Print the plan (paths, flags, phases) without changing
+                       anything, then exit.
+  --check              Run only Phase 4 self-tests against an existing install
+                       (skips clone/patch/install/cleanup).
+  --uninstall          Remove the installed MCPSearch package and generated
+                       artifacts (launcher, config snippet, source tree).
+  --purge              Like --uninstall but also removes logs, config dir, and
+                       the scratch tmp dir.
+
+Install behavior:
+  --skip-upgrade       Skip 'pkg upgrade' (the slowest step).
+  --force-reinstall    Force a clean clone (rm -rf source tree) instead of
+                       fetch+reset.
+  --keep-tmp           Keep the scratch tmp dir for debugging.
+  --no-rust            Skip the Rust toolchain and the Rust-link fallback tier.
+  --no-cache-test      Skip Phase 4b (network-dependent HTTP cache smoke test).
+  --no-progress        Disable animated spinner/progress bars.
+  --no-fail-fast       Downgrade 'fatal' errors to warnings and continue.
+  --verbose            Stream command logs to the console as well as files.
+  --yes                Auto-confirm prompts (e.g. uninstall/purge).
+  --no-color           Disable ANSI colors.
+  --log-level LEVEL    debug|info|warn|error (default: info).
+
+Sub-step skips:
+  --no-update          Skip 'pkg update'.
+  --no-pkg             Skip the Phase 1 package install loop.
+  --no-ensurepip       Skip 'python -m ensurepip'.
+  --no-pip-upgrade     Skip 'pip install --upgrade pip'.
+  --no-clone           Assume the source tree already exists (skip clone).
+  --no-strip-playwright  Skip removing Playwright from pyproject.toml.
+  --no-anysqlite       Skip inserting the anysqlite dependency.
+  --no-patch           Skip regex-patching server.py and http_client.py.
+  --no-editable        Skip the editable install of MCPSearch.
+  --no-selftest        Skip the Phase 4 self-tests.
+  --no-cleanup         Skip Phase 5 cleanup.
+  --no-verify          Skip grep-based verification of patch results.
+
+Paths & source:
+  --branch BRANCH      Upstream MCPSearch branch to clone (default: main).
+  --repo-url URL       Upstream MCPSearch repo URL.
+  --app-dir DIR        Where to clone MCPSearch (default: ~/MCPSearch).
+  --log-dir DIR        Log directory (default: ~/.mcpsearch_logs).
+  --config-dir DIR     Config/launcher directory (default: ~/.mcpsearch).
+  --tmp-dir DIR        Scratch directory (default: ~/.mcpsearch_tmp).
+  --prefix DIR         Termux prefix (default: $PREFIX).
+  --python CMD         Python interpreter (default: python3).
+
+Tuning:
+  --timeout SEC        Base timeout for pip/git ops (default: 60).
+  --jobs N             Rust/pip build parallelism (default: 1).
+  --opt-level N        Rust optimization level, 0-3 (default: 1).
+
+Cache test overrides (Phase 4b):
+  --cache-test-url URL           URL to fetch (default: https://httpbin.org/get).
+  --cache-test-timeout SEC       Request timeout (default: 30).
+  --cache-test-retries N         Retries (default: 2).
+  --cache-test-backoff F         Retry backoff seconds (default: 1.0).
+  --cache-test-interval F        Interval between the two requests (default: 0.0).
+  --no-httpbin                   Alias for --no-cache-test (skip the external call).
+
+Environment variables (lower priority than flags):
+  MCPSEARCH_APP_DIR, MCPSEARCH_LOG_DIR, MCPSEARCH_CONFIG_DIR,
+  MCPSEARCH_TMP_DIR, MCPSEARCH_REPO_URL, MCPSEARCH_BRANCH, MCPSEARCH_PYTHON,
+  MCPSEARCH_RUST_OPT, CARGO_BUILD_JOBS
+HELPEOF
+}
+
+_opt_value() {
+  # Resolves --flag VALUE or --flag=VALUE for the current $1/$2.
+  case "$1" in
+    *=*) printf '%s' "${1#*=}" ;;
+    *)   printf '%s' "$2" ;;
+  esac
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --help) usage; exit 0 ;;
+    --version) echo "MCPSearch Termux Installer v$VERSION"; exit 0 ;;
+    --dry-run) DRY_RUN=1; shift ;;
+    --check) CHECK_ONLY=1; shift ;;
+    --uninstall) UNINSTALL=1; shift ;;
+    --purge) PURGE=1; shift ;;
+    --skip-upgrade) SKIP_UPGRADE=1; shift ;;
+    --force-reinstall) FORCE_REINSTALL=1; shift ;;
+    --keep-tmp) KEEP_TMP=1; shift ;;
+    --no-rust) NO_RUST=1; shift ;;
+    --no-cache-test|--no-http-cache-test|--no-httpbin) NO_CACHE_TEST=1; shift ;;
+    --no-progress) NO_PROGRESS=1; shift ;;
+    --no-fail-fast) NO_FAIL_FAST=1; shift ;;
+    --verbose) VERBOSE=1; shift ;;
+    --yes|-y) YES=1; shift ;;
+    --no-color) NO_COLOR=1; shift ;;
+    --no-update) NO_UPDATE=1; shift ;;
+    --no-pkg) NO_PKG=1; shift ;;
+    --no-ensurepip) NO_ENSUREPIP=1; shift ;;
+    --no-pip-upgrade) NO_PIP_UPGRADE=1; shift ;;
+    --no-clone) NO_CLONE=1; shift ;;
+    --no-strip-playwright) NO_STRIP_PLAYWRIGHT=1; shift ;;
+    --no-anysqlite) NO_ANYSLITE=1; shift ;;
+    --no-patch) NO_PATCH=1; shift ;;
+    --no-editable) NO_EDITABLE=1; shift ;;
+    --no-selftest) NO_SELFTEST=1; shift ;;
+    --no-cleanup) NO_CLEANUP=1; shift ;;
+    --no-verify) NO_VERIFY=1; shift ;;
+    --log-level) LOG_LEVEL="$(_opt_value "$1" "$2")"; [ "$1" = "$2" ] && shift 2 || shift ;;
+    --log-level=*) LOG_LEVEL="${1#*=}"; shift ;;
+    --branch) BRANCH="$(_opt_value "$1" "$2")"; [ "$1" = "$2" ] && shift 2 || shift ;;
+    --branch=*) BRANCH="${1#*=}"; shift ;;
+    --repo-url) REPO_URL="$(_opt_value "$1" "$2")"; [ "$1" = "$2" ] && shift 2 || shift ;;
+    --repo-url=*) REPO_URL="${1#*=}"; shift ;;
+    --app-dir) APP_DIR="$(_opt_value "$1" "$2")"; [ "$1" = "$2" ] && shift 2 || shift ;;
+    --app-dir=*) APP_DIR="${1#*=}"; shift ;;
+    --log-dir) LOG_DIR="$(_opt_value "$1" "$2")"; [ "$1" = "$2" ] && shift 2 || shift ;;
+    --log-dir=*) LOG_DIR="${1#*=}"; shift ;;
+    --config-dir) CFG_DIR="$(_opt_value "$1" "$2")"; [ "$1" = "$2" ] && shift 2 || shift ;;
+    --config-dir=*) CFG_DIR="${1#*=}"; shift ;;
+    --tmp-dir) TMPDIR="$(_opt_value "$1" "$2")"; [ "$1" = "$2" ] && shift 2 || shift ;;
+    --tmp-dir=*) TMPDIR="${1#*=}"; shift ;;
+    --prefix) PREFIX="$(_opt_value "$1" "$2")"; [ "$1" = "$2" ] && shift 2 || shift ;;
+    --prefix=*) PREFIX="${1#*=}"; shift ;;
+    --python) PY="$(_opt_value "$1" "$2")"; [ "$1" = "$2" ] && shift 2 || shift ;;
+    --python=*) PY="${1#*=}"; shift ;;
+    --timeout) TIMEOUT="$(_opt_value "$1" "$2")"; [ "$1" = "$2" ] && shift 2 || shift ;;
+    --timeout=*) TIMEOUT="${1#*=}"; shift ;;
+    --jobs) JOBS="$(_opt_value "$1" "$2")"; [ "$1" = "$2" ] && shift 2 || shift ;;
+    --jobs=*) JOBS="${1#*=}"; shift ;;
+    --opt-level) OPT_LEVEL="$(_opt_value "$1" "$2")"; [ "$1" = "$2" ] && shift 2 || shift ;;
+    --opt-level=*) OPT_LEVEL="${1#*=}"; shift ;;
+    --cache-test-url) CACHE_TEST_URL="$(_opt_value "$1" "$2")"; [ "$1" = "$2" ] && shift 2 || shift ;;
+    --cache-test-url=*) CACHE_TEST_URL="${1#*=}"; shift ;;
+    --cache-test-timeout) CACHE_TEST_TIMEOUT="$(_opt_value "$1" "$2")"; [ "$1" = "$2" ] && shift 2 || shift ;;
+    --cache-test-timeout=*) CACHE_TEST_TIMEOUT="${1#*=}"; shift ;;
+    --cache-test-retries) CACHE_TEST_RETRIES="$(_opt_value "$1" "$2")"; [ "$1" = "$2" ] && shift 2 || shift ;;
+    --cache-test-retries=*) CACHE_TEST_RETRIES="${1#*=}"; shift ;;
+    --cache-test-backoff) CACHE_TEST_BACKOFF="$(_opt_value "$1" "$2")"; [ "$1" = "$2" ] && shift 2 || shift ;;
+    --cache-test-backoff=*) CACHE_TEST_BACKOFF="${1#*=}"; shift ;;
+    --cache-test-interval) CACHE_TEST_INTERVAL="$(_opt_value "$1" "$2")"; [ "$1" = "$2" ] && shift 2 || shift ;;
+    --cache-test-interval=*) CACHE_TEST_INTERVAL="${1#*=}"; shift ;;
+    *) warn "unknown option ignored: $1"; shift ;;
   esac
 done
-unset _arg
 
-# Memory-safe Rust build defaults. Android's process killer (signal 9) can
-# terminate cargo/rustc when they spawn many parallel jobs and pin the CPU.
-# Cap parallelism and lower optimization to keep peak memory in check.
-# Override with MCPSEARCH_RUST_OPT=3 for faster (heavier) release builds.
-export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}"
-RUST_OPT="${MCPSEARCH_RUST_OPT:-1}"
+# --- Post-parse setup ------------------------------------------------------
+mkdir -p "$LOG_DIR" "$CFG_DIR" "$TMPDIR"
+command -v "$PY" >/dev/null 2>&1 || { command -v python3 >/dev/null 2>&1 && PY="python3" || PY="python"; }
+# Detect the real Python version (major.minor) for the Rust link flag.
+PYVER=$("$PY" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || echo "3.11")
 
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
-step(){ echo -e "\n${CYAN}▶ $*${NC}"; }
-ok(){ echo -e "  ${GREEN}✔${NC} $*"; }
-err(){ echo -e "  ${RED}✘${NC} $*"; }
-warn(){ echo -e "  ${YELLOW}⚠${NC} $*"; }
-fatal(){ err "$*"; echo -e "${RED}Aborted. Logs: $LOG_DIR${NC}"; exit 1; }
+# Memory-safe Rust build defaults.
+export CARGO_BUILD_JOBS="$JOBS"
+RUST_OPT="$OPT_LEVEL"
 
-# ---------------------------------------------------------------------------
-# Self-integrity check: verify this script file is complete (not truncated).
-# A truncated download (e.g. interrupted git clone / curl) would otherwise
-# die mid-here-doc with a confusing "here-document ... delimited by
-# end-of-file" error. Each closing here-doc delimiter must appear alone on
-# its own line; if any is missing, the file was cut off. Fail fast instead.
-# ---------------------------------------------------------------------------
+# --- Colors & logging ------------------------------------------------------
+if [ "$NO_COLOR" -eq 1 ]; then
+  RED=''; GREEN=''; YELLOW=''; CYAN=''; BOLD=''; NC=''
+else
+  RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
+fi
+
+# Numeric log-level threshold: debug=0 info=1 warn=2 error=3
+case "$LOG_LEVEL" in
+  debug) _LEVEL=0 ;; warn) _LEVEL=2 ;; error) _LEVEL=3 ;; *) _LEVEL=1 ;;
+esac
+
+log() { # log LEVEL msg
+  local lvl="$1" msg="$2" n=1
+  case "$lvl" in debug) n=0 ;; info) n=1 ;; warn) n=2 ;; error) n=3 ;; esac
+  [ "$n" -ge "$_LEVEL" ] && echo -e "$msg"
+}
+
+step(){ log info "\n${CYAN}▶ $*${NC}"; }
+ok(){ log info "  ${GREEN}✔${NC} $*"; }
+err(){ log error "  ${RED}✘${NC} $*"; }
+warn(){ log warn "  ${YELLOW}⚠${NC} $*"; }
+fatal(){
+  if [ "$NO_FAIL_FAST" -eq 1 ]; then
+    warn "$* (continuing due to --no-fail-fast)"
+  else
+    err "$*"; echo -e "${RED}Aborted. Logs: $LOG_DIR${NC}"; exit 1
+  fi
+}
+
+# Stream-aware command runner: in verbose mode tee logs to console.
+_run(){ # _run logfile cmd...
+  local logf="$1"; shift
+  if [ "$VERBOSE" -eq 1 ]; then
+    "$@" 2>&1 | tee -a "$logf"
+    return "${PIPESTATUS[0]}"
+  else
+    "$@" >> "$logf" 2>&1
+  fi
+}
+
+# --- Self-integrity check --------------------------------------------------
 _SELF="$0"
-for _delim in PYEOF LAUNCHER_EOF JSONEOF TESTEOF CACHETESTEOF; do
+for _delim in HELPEOF PYEOF LAUNCHER_EOF JSONEOF TESTEOF CACHETESTEOF; do
   if ! grep -q "^${_delim}$" "$_SELF"; then
     echo -e "${RED}✘ This installer file appears truncated (missing here-doc terminator '${_delim}').${NC}"
     echo -e "${RED}  The download was incomplete. Please re-download it fully, e.g.:${NC}"
@@ -118,40 +306,81 @@ for _delim in PYEOF LAUNCHER_EOF JSONEOF TESTEOF CACHETESTEOF; do
 done
 unset _SELF _delim
 
-# Animated spinner + message while a background command ($1 = pid) runs.
-# Draws on a single line with \r and clears it when done.
+# --- Progress helpers ------------------------------------------------------
 SPIN=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
 spinner() {
   local pid="$1" msg="$2" i=0
+  if [ "$NO_PROGRESS" -eq 1 ]; then wait "$pid"; return; fi
   while kill -0 "$pid" 2>/dev/null; do
     printf "\r  ${CYAN}%s${NC} %s ..." "${SPIN[$((i % ${#SPIN[@]}))]}" "$msg"
-    i=$((i + 1))
-    sleep 0.1
+    i=$((i + 1)); sleep 0.1
   done
   printf "\r\033[K"
 }
-
-# Per-package progress bar: shows X/Y and a filled bar while a package
-# installs. $1=current, $2=total, $3=package name, $4=pid to watch.
 pkg_progress() {
   local cur="$1" total="$2" name="$3" pid="$4" i=0 width=24
+  if [ "$NO_PROGRESS" -eq 1 ]; then wait "$pid"; return; fi
   while kill -0 "$pid" 2>/dev/null; do
-    local pct=$((cur * 100 / total))
-    local filled=$((cur * width / total))
-    local bar=""
-    local j
+    local pct=$((cur * 100 / total)) filled=$((cur * width / total)) bar="" j
     for ((j = 0; j < width; j++)); do
       if [ "$j" -lt "$filled" ]; then bar="${bar}█"; else bar="${bar}░"; fi
     done
     printf "\r  ${CYAN}%s${NC} installing %-12s ${CYAN}[%s]${NC} %3d%% (%d/%d) ..." \
       "${SPIN[$((i % ${#SPIN[@]}))]}" "$name" "$bar" "$pct" "$cur" "$total"
-    i=$((i + 1))
-    sleep 0.1
+    i=$((i + 1)); sleep 0.1
   done
   printf "\r\033[K"
 }
 
-echo -e "${BOLD}${CYAN}== MCPSearch Termux Installer — Phases 1-5 (v1.7) ==${NC}"
+# --- Dry-run report --------------------------------------------------------
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo -e "${BOLD}${CYAN}== MCPSearch Termux Installer — DRY RUN (v$VERSION) ==${NC}"
+  echo "  app-dir:      $APP_DIR"
+  echo "  log-dir:      $LOG_DIR"
+  echo "  config-dir:   $CFG_DIR"
+  echo "  tmp-dir:      $TMPDIR"
+  echo "  prefix:       $PREFIX"
+  echo "  python:       $PY ($PYVER)"
+  echo "  repo-url:     $REPO_URL"
+  echo "  branch:       $BRANCH"
+  echo "  timeout:      ${TIMEOUT}s   jobs: $JOBS   rust-opt: $OPT_LEVEL"
+  echo "  skip-upgrade: $SKIP_UPGRADE   force-reinstall: $FORCE_REINSTALL"
+  echo "  no-rust:      $NO_RUST   no-cache-test: $NO_CACHE_TEST"
+  echo "  no-pkg:       $NO_PKG   no-clone: $NO_CLONE   no-patch: $NO_PATCH"
+  echo "  no-selftest:  $NO_SELFTEST   no-cleanup: $NO_CLEANUP"
+  echo -e "${CYAN}Would run: Phase 0 storage check → Phase 1 packages → Phase 2 clone/patch/install → Phase 3 launcher → Phase 4 self-tests → Phase 5 cleanup.${NC}"
+  exit 0
+fi
+
+# --- Uninstall / purge -----------------------------------------------------
+if [ "$UNINSTALL" -eq 1 ] || [ "$PURGE" -eq 1 ]; then
+  if [ "$YES" -eq 1 ]; then _confirm=1; else
+    read -r -p "Remove MCPSearch installation? [y/N] " _ans
+    case "$_ans" in y|Y|yes|YES) _confirm=1 ;; *) _confirm=0 ;; esac
+  fi
+  if [ "$_confirm" -eq 1 ]; then
+    echo -e "${CYAN}▶ Uninstalling MCPSearch...${NC}"
+    "$PY" -m pip uninstall -y mcpsearch >/dev/null 2>&1 || true
+    rm -rf "$APP_DIR"
+    rm -f "$CFG_DIR/run.sh" "$CFG_DIR/mcp_client_snippet.json"
+    echo -e "  ${GREEN}✔${NC} removed package and source tree"
+    if [ "$PURGE" -eq 1 ]; then
+      rm -rf "$CFG_DIR" "$LOG_DIR" "$TMPDIR"
+      "$PY" -m pip cache purge >/dev/null 2>&1 || true
+      echo -e "  ${GREEN}✔${NC} purged config, logs, tmp, and pip cache"
+    fi
+  fi
+  exit 0
+fi
+
+echo -e "${BOLD}${CYAN}== MCPSearch Termux Installer — Phases 1-5 (v$VERSION) ==${NC}"
+
+# --- Check-only mode -------------------------------------------------------
+if [ "$CHECK_ONLY" -eq 1 ]; then
+  step "Check mode: running Phase 4 self-tests against existing install at $APP_DIR"
+  [ -d "$APP_DIR" ] || fatal "no existing install found at $APP_DIR"
+  NO_CLONE=1; NO_PATCH=1; NO_EDITABLE=1; NO_CLEANUP=1
+fi
 
 # ---------------------------------------------------------------- PHASE 0
 step "Phase 0: Storage pre-flight check"
@@ -169,70 +398,108 @@ fi
 unset _FREE_KB _FREE_GB
 
 # ---------------------------------------------------------------- PHASE 1
-step "Phase 1: Termux packages"
-pkg update -y > "$LOG_DIR/p1.log" 2>&1 &
-_PID=$!
-spinner "$_PID" "pkg update"
-if wait "$_PID"; then ok "pkg update"; else warn "pkg update had issues"; fi
-
-pkg upgrade -y >> "$LOG_DIR/p1.log" 2>&1 &
-_PID=$!
-spinner "$_PID" "pkg upgrade (this can take a while)"
-if wait "$_PID"; then ok "pkg upgrade"; else warn "pkg upgrade had issues"; fi
-
-if [ "$NO_RUST" -eq 1 ]; then
-  warn "Rust toolchain skipped (--no-rust). Rust-based packages (pydantic-core) will only install if a prebuilt wheel exists."
-  PKGS="python git binutils libjpeg-turbo libxml2 libxslt clang make pkg-config openssl patchelf curl"
+if [ "$NO_PKG" -eq 1 ]; then
+  step "Phase 1: Termux packages (skipped via --no-pkg)"
 else
-  PKGS="python git rust binutils libjpeg-turbo libxml2 libxslt clang make pkg-config openssl patchelf curl"
+  step "Phase 1: Termux packages"
+  if [ "$NO_UPDATE" -eq 1 ]; then
+    warn "skipping 'pkg update' (--no-update)"
+  else
+    pkg update -y > "$LOG_DIR/p1.log" 2>&1 &
+    _PID=$!; spinner "$_PID" "pkg update"
+    if wait "$_PID"; then ok "pkg update"; else warn "pkg update had issues"; fi
+  fi
+
+  if [ "$SKIP_UPGRADE" -eq 1 ]; then
+    warn "skipping 'pkg upgrade' (--skip-upgrade)"
+  else
+    pkg upgrade -y >> "$LOG_DIR/p1.log" 2>&1 &
+    _PID=$!; spinner "$_PID" "pkg upgrade (this can take a while)"
+    if wait "$_PID"; then ok "pkg upgrade"; else warn "pkg upgrade had issues"; fi
+  fi
+
+  if [ "$NO_RUST" -eq 1 ]; then
+    warn "Rust toolchain skipped (--no-rust). Rust-based packages (pydantic-core) will only install if a prebuilt wheel exists."
+    PKGS="python git binutils libjpeg-turbo libxml2 libxslt clang make pkg-config openssl patchelf curl"
+  else
+    PKGS="python git rust binutils libjpeg-turbo libxml2 libxslt clang make pkg-config openssl patchelf curl"
+  fi
+  set -- $PKGS
+  TOTAL=$#
+  CUR=0
+  for p in $PKGS; do
+    CUR=$((CUR + 1))
+    pkg install -y "$p" >> "$LOG_DIR/p1.log" 2>&1 &
+    _PID=$!; pkg_progress "$CUR" "$TOTAL" "$p" "$_PID"
+    if wait "$_PID"; then ok "$p"; else fatal "failed to install $p (see $LOG_DIR/p1.log)"; fi
+  done
+
+  if [ "$NO_ENSUREPIP" -eq 1 ]; then
+    warn "skipping 'python -m ensurepip' (--no-ensurepip)"
+  else
+    "$PY" -m ensurepip --upgrade > "$LOG_DIR/p1_pip.log" 2>&1 || true
+  fi
+  if [ "$NO_PIP_UPGRADE" -eq 1 ]; then
+    warn "skipping pip upgrade (--no-pip-upgrade)"
+  else
+    "$PY" -m pip install --upgrade pip --break-system-packages >> "$LOG_DIR/p1_pip.log" 2>&1 || warn "pip upgrade had issues"
+  fi
+  ok "interpreter ready: $("$PY" --version 2>&1)"
 fi
-set -- $PKGS
-TOTAL=$#
-CUR=0
-for p in $PKGS; do
-  CUR=$((CUR + 1))
-  pkg install -y "$p" >> "$LOG_DIR/p1.log" 2>&1 &
-  _PID=$!
-  pkg_progress "$CUR" "$TOTAL" "$p" "$_PID"
-  if wait "$_PID"; then ok "$p"; else fatal "failed to install $p (see $LOG_DIR/p1.log)"; fi
-done
-"$PY" -m ensurepip --upgrade > "$LOG_DIR/p1_pip.log" 2>&1 || true
-"$PY" -m pip install --upgrade pip --break-system-packages >> "$LOG_DIR/p1_pip.log" 2>&1 || warn "pip upgrade had issues"
-ok "interpreter ready: $("$PY" --version 2>&1)"
 
 # ---------------------------------------------------------------- PHASE 2
 step "Phase 2: Clone MCPSearch"
-if [ -d "$APP_DIR/.git" ]; then
-  git -C "$APP_DIR" fetch origin >> "$LOG_DIR/p2.log" 2>&1
-  git -C "$APP_DIR" reset --hard origin/main >> "$LOG_DIR/p2.log" 2>&1
+if [ "$NO_CLONE" -eq 1 ]; then
+  warn "skipping clone (--no-clone); assuming source already present at $APP_DIR"
 else
-  rm -rf "$APP_DIR"
-  git clone "$REPO_URL" "$APP_DIR" > "$LOG_DIR/p2.log" 2>&1 || fatal "git clone failed (see $LOG_DIR/p2.log)"
+  if [ "$FORCE_REINSTALL" -eq 1 ]; then
+    rm -rf "$APP_DIR"
+    git clone --branch "$BRANCH" "$REPO_URL" "$APP_DIR" > "$LOG_DIR/p2.log" 2>&1 || fatal "git clone failed (see $LOG_DIR/p2.log)"
+    ok "fresh clone complete (--force-reinstall) at $APP_DIR"
+  elif [ -d "$APP_DIR/.git" ]; then
+    git -C "$APP_DIR" fetch origin >> "$LOG_DIR/p2.log" 2>&1
+    git -C "$APP_DIR" reset --hard "origin/$BRANCH" >> "$LOG_DIR/p2.log" 2>&1
+    ok "source updated at $APP_DIR"
+  else
+    rm -rf "$APP_DIR"
+    git clone --branch "$BRANCH" "$REPO_URL" "$APP_DIR" > "$LOG_DIR/p2.log" 2>&1 || fatal "git clone failed (see $LOG_DIR/p2.log)"
+  fi
 fi
 [ -f "$APP_DIR/pyproject.toml" ] && [ -f "$APP_DIR/mcp_server/server.py" ] || fatal "source tree missing expected files"
 ok "source ready at $APP_DIR"
 
-step "Phase 2: Strip Playwright (HTTP-only mode)"
-sed -i '/[Pp]laywright/d' "$APP_DIR/pyproject.toml"
-ok "playwright references removed from pyproject.toml"
-
-step "Phase 2: Ensure anysqlite dependency for hishel async cache backend"
-if grep -q "anysqlite" "$APP_DIR/pyproject.toml"; then
-  ok "anysqlite already declared in pyproject.toml"
+if [ "$NO_STRIP_PLAYWRIGHT" -eq 1 ]; then
+  warn "skipping Playwright strip (--no-strip-playwright)"
 else
-  if grep -q '"hishel[^"]*",' "$APP_DIR/pyproject.toml"; then
-    sed -i '/"hishel[^"]*"/a\    "anysqlite>=0.0.5",' "$APP_DIR/pyproject.toml"
-    ok "anysqlite>=0.0.5 inserted after hishel dependency"
-  elif grep -q '"httpx[^"]*",' "$APP_DIR/pyproject.toml"; then
-    sed -i '/"httpx[^"]*",/a\    "hishel>=1.0.0",\n    "anysqlite>=0.0.5",' "$APP_DIR/pyproject.toml"
-    ok "hishel + anysqlite inserted after httpx dependency"
+  step "Phase 2: Strip Playwright (HTTP-only mode)"
+  sed -i '/[Pp]laywright/d' "$APP_DIR/pyproject.toml"
+  ok "playwright references removed from pyproject.toml"
+fi
+
+if [ "$NO_ANYSLITE" -eq 1 ]; then
+  warn "skipping anysqlite insertion (--no-anysqlite)"
+else
+  step "Phase 2: Ensure anysqlite dependency for hishel async cache backend"
+  if grep -q "anysqlite" "$APP_DIR/pyproject.toml"; then
+    ok "anysqlite already declared in pyproject.toml"
   else
-    warn "could not find hishel/httpx anchor line in pyproject.toml; anysqlite NOT inserted — verify manually"
+    if grep -q '"hishel[^"]*",' "$APP_DIR/pyproject.toml"; then
+      sed -i '/"hishel[^"]*"/a\    "anysqlite>=0.0.5",' "$APP_DIR/pyproject.toml"
+      ok "anysqlite>=0.0.5 inserted after hishel dependency"
+    elif grep -q '"httpx[^"]*",' "$APP_DIR/pyproject.toml"; then
+      sed -i '/"httpx[^"]*",/a\    "hishel>=1.0.0",\n    "anysqlite>=0.0.5",' "$APP_DIR/pyproject.toml"
+      ok "hishel + anysqlite inserted after httpx dependency"
+    else
+      warn "could not find hishel/httpx anchor line in pyproject.toml; anysqlite NOT inserted — verify manually"
+    fi
   fi
 fi
 
-step "Phase 2: Patch mcp_server/server.py (regex-based, idempotent)"
-cat > "$TMPDIR/mcpsearch_patch.py" << 'PYEOF'
+if [ "$NO_PATCH" -eq 1 ]; then
+  warn "skipping server.py / http_client.py patches (--no-patch)"
+else
+  step "Phase 2: Patch mcp_server/server.py (regex-based, idempotent)"
+  cat > "$TMPDIR/mcpsearch_patch.py" << 'PYEOF'
 import re, sys, os
 
 path = os.path.expanduser("~/MCPSearch/mcp_server/server.py")
@@ -255,10 +522,6 @@ if "get_research_agent()" in src and "import get_research_agent" not in src:
     notes.append("inserted missing get_research_agent import")
 
 # 2. Replace bare factory-object names with their get_X() calls.
-#    \b already prevents matching inside get_crawler/get_summarizer/etc,
-#    since '_' and the following letter are both word chars (no boundary).
-#    Import/from lines are skipped so `from crawler.engine import ...`
-#    is never touched.
 bare_names = ["aggregator", "crawler", "summarizer",
               "reddit_scraper", "twitter_scraper", "youtube_scraper", "github_scraper"]
 src_lines = src.split("\n")
@@ -311,35 +574,35 @@ investigate_body = '''    agent = get_research_agent()
         for f in findings:
             by_type.setdefault(f["source"]["source_type"], []).append(f)
 
-        lines = [f"# Research: {topic}\n", f"**Depth:** {depth} | **Social:** {include_social}\n"]
+        lines = [f"# Research: {topic}\\n", f"**Depth:** {depth} | **Social:** {include_social}\\n"]
 
         web = by_type.get("web", []) + by_type.get("web_crawled", [])
         if web:
-            lines.append("## Web Search Results\n")
+            lines.append("## Web Search Results\\n")
             for i, f in enumerate(web, 1):
                 s = f["source"]
                 lines.append(f"{i}. **{s.get('title', 'No title')}**")
                 lines.append(f"   [{s.get('url', 'N/A')}]({s.get('url', 'N/A')})")
                 if f.get("content"):
-                    lines.append(f"   {f['content'][:200]}\n")
+                    lines.append(f"   {f['content'][:200]}\\n")
 
         social = [t for t in by_type if t not in ("web", "web_crawled")]
         if social:
-            lines.append("\n## Social Media Insights\n")
+            lines.append("\\n## Social Media Insights\\n")
             for platform in social:
-                lines.append(f"### {platform.title()}\n")
+                lines.append(f"### {platform.title()}\\n")
                 for f in by_type[platform][:3]:
                     lines.append(f"- {f['content'][:150]}")
                 lines.append("")
 
         if report.get("summary"):
-            lines.append("\n## AI Summary\n")
+            lines.append("\\n## AI Summary\\n")
             lines.append(report["summary"])
 
-        return "\n".join(lines)
+        return "\\n".join(lines)
     except Exception as e:
         import logging, traceback
-        logging.error(f"investigate error: {e}\n{traceback.format_exc()}")
+        logging.error(f"investigate error: {e}\\n{traceback.format_exc()}")
         return f"Error: {str(e)}"
 '''
 
@@ -348,24 +611,24 @@ compare_body = '''    agent = get_research_agent()
         topic_list = [t.strip() for t in topics.split(",") if t.strip()]
         comparison = await agent.compare(topic_list, search_depth=depth)
 
-        lines = [f"# Comparison: {' vs '.join(topic_list)}\n"]
+        lines = [f"# Comparison: {' vs '.join(topic_list)}\\n"]
         for topic in topic_list:
             report = comparison["reports"][topic]
-            lines.append(f"## {topic}\n")
+            lines.append(f"## {topic}\\n")
             web = [f for f in report.get("findings", [])
                    if f["source"]["source_type"] in ("web", "web_crawled")]
             if web:
-                lines.append("### Key Results\n")
+                lines.append("### Key Results\\n")
                 for f in web[:2]:
                     s = f["source"]
                     lines.append(f"- **{s.get('title', 'N/A')}**")
-                    lines.append(f"  {f['content'][:100]}\n")
+                    lines.append(f"  {f['content'][:100]}\\n")
             lines.append("")
 
-        return "\n".join(lines)
+        return "\\n".join(lines)
     except Exception as e:
         import logging, traceback
-        logging.error(f"compare error: {e}\n{traceback.format_exc()}")
+        logging.error(f"compare error: {e}\\n{traceback.format_exc()}")
         return f"Error: {str(e)}"
 '''
 
@@ -376,9 +639,9 @@ trending_body = '''    try:
         if "reddit" in platforms:
             result["reddit"] = await get_reddit_scraper().get_trending()
 
-        lines = ["# Trending Topics\n"]
+        lines = ["# Trending Topics\\n"]
         for platform, items in result.items():
-            lines.append(f"## {platform.title()}\n")
+            lines.append(f"## {platform.title()}\\n")
             item_list = items if isinstance(items, list) else (
                 getattr(items, "posts", None) or getattr(items, "repos", None) or []
             )
@@ -387,10 +650,10 @@ trending_body = '''    try:
                     lines.append(f"{i}. {str(item)[:150]}")
             lines.append("")
 
-        return "\n".join(lines)
+        return "\\n".join(lines)
     except Exception as e:
         import logging, traceback
-        logging.error(f"trending error: {e}\n{traceback.format_exc()}")
+        logging.error(f"trending error: {e}\\n{traceback.format_exc()}")
         return f"Error: {str(e)}"
 '''
 
@@ -429,12 +692,16 @@ if "get_research_agent_instance" in src:
     sys.exit(1)
 print("VERIFY_OK: patch script completed without fatal issues")
 PYEOF
-"$PY" "$TMPDIR/mcpsearch_patch.py" 2>&1 | tee "$LOG_DIR/p2_patch.log"
-grep -q "VERIFY_OK" "$LOG_DIR/p2_patch.log" || fatal "server.py patch verification failed, see "$LOG_DIR/p2_patch.log""
-ok "server.py patched"
+  "$PY" "$TMPDIR/mcpsearch_patch.py" 2>&1 | tee "$LOG_DIR/p2_patch.log"
+  if [ "$NO_VERIFY" -eq 1 ]; then
+    ok "server.py patch script completed (verification skipped)"
+  else
+    grep -q "VERIFY_OK" "$LOG_DIR/p2_patch.log" || fatal "server.py patch verification failed, see $LOG_DIR/p2_patch.log"
+    ok "server.py patched"
+  fi
 
-step "Phase 2: Patch utils/http_client.py — remove deprecated hishel kwarg (idempotent)"
-cat > "$TMPDIR/mcpsearch_patch_httpclient.py" << 'PYEOF'
+  step "Phase 2: Patch utils/http_client.py — remove deprecated hishel kwarg (idempotent)"
+  cat > "$TMPDIR/mcpsearch_patch_httpclient.py" << 'PYEOF'
 import re, os
 
 path = os.path.expanduser("~/MCPSearch/utils/http_client.py")
@@ -459,29 +726,28 @@ else:
         print("NOOP: no deprecated refresh_ttl_on_access kwarg found (already clean or never present)")
 print("VERIFY_OK: http_client.py patch script completed")
 PYEOF
-"$PY" "$TMPDIR/mcpsearch_patch_httpclient.py" 2>&1 | tee "$LOG_DIR/p2_patch_httpclient.log"
-grep -q "VERIFY_OK" "$LOG_DIR/p2_patch_httpclient.log" || fatal "http_client.py patch verification failed, see "$LOG_DIR/p2_patch_httpclient.log""
-"$PY" -m py_compile "$APP_DIR/utils/http_client.py" 2>>"$LOG_DIR/p2_patch_httpclient.log" \
-  && ok "http_client.py patched and compiles cleanly" \
-  || fatal "http_client.py failed to compile after patch, see "$LOG_DIR/p2_patch_httpclient.log""
+  "$PY" "$TMPDIR/mcpsearch_patch_httpclient.py" 2>&1 | tee "$LOG_DIR/p2_patch_httpclient.log"
+  if [ "$NO_VERIFY" -eq 1 ]; then
+    ok "http_client.py patch script completed (verification skipped)"
+  else
+    grep -q "VERIFY_OK" "$LOG_DIR/p2_patch_httpclient.log" || fatal "http_client.py patch verification failed, see $LOG_DIR/p2_patch_httpclient.log"
+  fi
+  "$PY" -m py_compile "$APP_DIR/utils/http_client.py" 2>>"$LOG_DIR/p2_patch_httpclient.log" \
+    && ok "http_client.py patched and compiles cleanly" \
+    || fatal "http_client.py failed to compile after patch, see $LOG_DIR/p2_patch_httpclient.log"
+fi
 
 step "Phase 2: Install Python dependencies (with fallback tiers)"
 install_pkg() {
   local pkg="$1"
-  # Tier 1: prebuilt wheel (fast, no compile). --no-cache-dir keeps pip's
-  # download cache from eating GBs of storage on constrained devices.
-  timeout 60 "$PY" -m pip install --quiet --no-cache-dir --break-system-packages "$pkg" >> "$LOG_DIR/p2_pip.log" 2>&1 && return 0
+  timeout "$TIMEOUT" "$PY" -m pip install --quiet --no-cache-dir --break-system-packages "$pkg" >> "$LOG_DIR/p2_pip.log" 2>&1 && return 0
   warn "$pkg: wheel install failed, retrying --no-binary"
-  # Tier 2: compile from source (no prebuilt binary).
-  timeout 180 "$PY" -m pip install --quiet --no-cache-dir --break-system-packages --no-binary :all: "$pkg" >> "$LOG_DIR/p2_pip.log" 2>&1 && return 0
-  # Tier 3: package-aware last resort.
+  timeout $((TIMEOUT * 3)) "$PY" -m pip install --quiet --no-cache-dir --break-system-packages --no-binary :all: "$pkg" >> "$LOG_DIR/p2_pip.log" 2>&1 && return 0
   case "$pkg" in
     lxml|selectolax)
-      # C-extension packages link against Termux's libxml2/libxslt, NOT Rust.
-      # Point CFLAGS/LDFLAGS at the Termux prefix so the build finds them.
       warn "$pkg: retrying with C library link flags (libxml2/libxslt)"
       CFLAGS="-I$PREFIX/include" LDFLAGS="-L$PREFIX/lib" \
-      timeout 240 "$PY" -m pip install --quiet --no-cache-dir --break-system-packages --force-reinstall --no-binary :all: "$pkg" >> "$LOG_DIR/p2_pip.log" 2>&1
+      timeout $((TIMEOUT * 4)) "$PY" -m pip install --quiet --no-cache-dir --break-system-packages --force-reinstall --no-binary :all: "$pkg" >> "$LOG_DIR/p2_pip.log" 2>&1
       ;;
     *)
       if [ "$NO_RUST" -eq 1 ]; then
@@ -489,8 +755,8 @@ install_pkg() {
         return 1
       fi
       warn "$pkg: retrying with rust link flags (python${PYVER})"
-      RUSTFLAGS="-C opt-level=${RUST_OPT} -C link-arg=-lpython${PYVER}" CARGO_BUILD_JOBS=1 \
-      timeout 300 "$PY" -m pip install --quiet --no-cache-dir --break-system-packages --force-reinstall "$pkg" >> "$LOG_DIR/p2_pip.log" 2>&1
+      RUSTFLAGS="-C opt-level=${RUST_OPT} -C link-arg=-lpython${PYVER}" CARGO_BUILD_JOBS="$JOBS" \
+      timeout $((TIMEOUT * 5)) "$PY" -m pip install --quiet --no-cache-dir --break-system-packages --force-reinstall "$pkg" >> "$LOG_DIR/p2_pip.log" 2>&1
       ;;
   esac
 }
@@ -498,11 +764,19 @@ DEP_FAIL=0
 for pkg in pydantic pydantic-settings httpx beautifulsoup4 lxml selectolax mcp hishel anysqlite; do
   install_pkg "$pkg" && ok "$pkg" || { err "$pkg failed all install tiers"; DEP_FAIL=1; }
 done
-[ "$DEP_FAIL" -eq 1 ] && fatal "dependency install failed (see "$LOG_DIR/p2_pip.log")"
+if [ "$NO_FAIL_FAST" -eq 1 ]; then
+  [ "$DEP_FAIL" -eq 1 ] && warn "dependency install had failures (continuing via --no-fail-fast)"
+else
+  [ "$DEP_FAIL" -eq 1 ] && fatal "dependency install failed (see $LOG_DIR/p2_pip.log)"
+fi
 
-step "Phase 2: Editable install of MCPSearch"
-timeout 120 "$PY" -m pip install --quiet --no-cache-dir --break-system-packages -e "$APP_DIR" > "$LOG_DIR/p2_editable.log" 2>&1 \
-  && ok "editable install complete" || fatal "editable install failed (see "$LOG_DIR/p2_editable.log")"
+if [ "$NO_EDITABLE" -eq 1 ]; then
+  warn "skipping editable install (--no-editable)"
+else
+  step "Phase 2: Editable install of MCPSearch"
+  timeout 120 "$PY" -m pip install --quiet --no-cache-dir --break-system-packages -e "$APP_DIR" > "$LOG_DIR/p2_editable.log" 2>&1 \
+    && ok "editable install complete" || fatal "editable install failed (see $LOG_DIR/p2_editable.log)"
+fi
 
 # ---------------------------------------------------------------- PHASE 3
 step "Phase 3: Generate launcher and MCP client config"
@@ -512,7 +786,7 @@ cd "$APP_DIR" || exit 1
 exec $PY -m mcp_server
 LAUNCHER_EOF
 chmod +x "$CFG_DIR/run.sh"
-ok "launcher written to "$CFG_DIR/run.sh""
+ok "launcher written to $CFG_DIR/run.sh"
 
 cat > "$CFG_DIR/mcp_client_snippet.json" << 'JSONEOF'
 {
@@ -524,12 +798,15 @@ cat > "$CFG_DIR/mcp_client_snippet.json" << 'JSONEOF'
   }
 }
 JSONEOF
-ok "MCP client config snippet written to "$CFG_DIR/mcp_client_snippet.json""
+ok "MCP client config snippet written to $CFG_DIR/mcp_client_snippet.json"
 warn "This is a stdio MCP server: it is meant to be launched by an MCP client (e.g. Claude Desktop, Cursor), not run standalone as a network daemon. Merge the snippet above into your client's config file."
 
 # ---------------------------------------------------------------- PHASE 4
-step "Phase 4: Self-test — import server and exercise a tool call"
-cat > "$TMPDIR/mcpsearch_selftest.py" << 'TESTEOF'
+if [ "$NO_SELFTEST" -eq 1 ]; then
+  warn "skipping Phase 4 self-tests (--no-selftest)"
+else
+  step "Phase 4: Self-test — import server and exercise a tool call"
+  cat > "$TMPDIR/mcpsearch_selftest.py" << 'TESTEOF'
 import sys, os, asyncio, traceback
 
 sys.path.insert(0, os.path.expanduser("~/MCPSearch"))
@@ -573,16 +850,19 @@ except Exception as e:
 
 print("SELFTEST_PASS")
 TESTEOF
-if "$PY" "$TMPDIR/mcpsearch_selftest.py" 2>&1 | tee "$LOG_DIR/p4_selftest.log" | grep -q "SELFTEST_PASS"; then
-  ok "self-test passed — server imports and responds to a tool call cleanly"
-else
-  err "self-test FAILED — see "$LOG_DIR/p4_selftest.log" for the full traceback"
-  echo -e "${YELLOW}The install finished but the server is not confirmed working. Review the log above.${NC}"
-  exit 1
-fi
+  if "$PY" "$TMPDIR/mcpsearch_selftest.py" 2>&1 | tee "$LOG_DIR/p4_selftest.log" | grep -q "SELFTEST_PASS"; then
+    ok "self-test passed — server imports and responds to a tool call cleanly"
+  else
+    err "self-test FAILED — see $LOG_DIR/p4_selftest.log for the full traceback"
+    echo -e "${YELLOW}The install finished but the server is not confirmed working. Review the log above.${NC}"
+    exit 1
+  fi
 
-step "Phase 4b: HTTP cache smoke test (hishel + anysqlite, no deprecation warnings)"
-cat > "$TMPDIR/mcpsearch_cache_selftest.py" << 'CACHETESTEOF'
+  if [ "$NO_CACHE_TEST" -eq 1 ]; then
+    warn "skipping Phase 4b HTTP cache smoke test (--no-cache-test)"
+  else
+    step "Phase 4b: HTTP cache smoke test (hishel + anysqlite, no deprecation warnings)"
+    cat > "$TMPDIR/mcpsearch_cache_selftest.py" << 'CACHETESTEOF'
 import sys, os, asyncio, warnings, traceback
 
 sys.path.insert(0, os.path.expanduser("~/MCPSearch"))
@@ -613,8 +893,8 @@ async def main():
             return
 
     try:
-        r1 = await client.get("https://httpbin.org/get")
-        r2 = await client.get("https://httpbin.org/get")
+        r1 = await client.get("__CACHE_TEST_URL__")
+        r2 = await client.get("__CACHE_TEST_URL__")
         await client.aclose()
     except Exception as e:
         fail("cached client GET request failed (network or hishel wiring issue)", e)
@@ -632,30 +912,42 @@ async def main():
 
 asyncio.run(main())
 CACHETESTEOF
-if "$PY" "$TMPDIR/mcpsearch_cache_selftest.py" 2>&1 | tee "$LOG_DIR/p4b_cache_selftest.log" | grep -q "CACHETEST_PASS"; then
-  ok "HTTP cache self-test passed — hishel/anysqlite wired correctly, no deprecation warnings"
-else
-  err "HTTP cache self-test FAILED — see "$LOG_DIR/p4b_cache_selftest.log" for the full traceback"
-  echo -e "${YELLOW}Server imports fine but the HTTP cache layer used by search_and_summarize etc. is broken. Review the log above.${NC}"
-  exit 1
+    # Substitute cache-test overrides into the generated test.
+    sed -i "s|__CACHE_TEST_URL__|${CACHE_TEST_URL}|g" "$TMPDIR/mcpsearch_cache_selftest.py"
+    if "$PY" "$TMPDIR/mcpsearch_cache_selftest.py" 2>&1 | tee "$LOG_DIR/p4b_cache_selftest.log" | grep -q "CACHETEST_PASS"; then
+      ok "HTTP cache self-test passed — hishel/anysqlite wired correctly, no deprecation warnings"
+    else
+      err "HTTP cache self-test FAILED — see $LOG_DIR/p4b_cache_selftest.log for the full traceback"
+      echo -e "${YELLOW}Server imports fine but the HTTP cache layer used by search_and_summarize etc. is broken. Review the log above.${NC}"
+      exit 1
+    fi
+  fi
 fi
 
 # ---------------------------------------------------------------- PHASE 5
-step "Phase 5: Post-install cleanup (reclaim build space)"
-"$PY" -m pip cache purge > "$LOG_DIR/p5_cleanup.log" 2>&1 || true
-rm -rf "$HOME/.cache/pip" 2>/dev/null
-rm -rf "$TMPDIR" 2>/dev/null
-rm -rf "$HOME/.cargo/registry" 2>/dev/null
-_FREE_KB=$(df -P "$HOME" 2>/dev/null | awk 'NR==2 {print $4}')
-if [ -n "$_FREE_KB" ] && [ "$_FREE_KB" -gt 0 ] 2>/dev/null; then
-  _FREE_GB=$((_FREE_KB / 1024 / 1024))
-  ok "cleared pip/cargo build caches — ~${_FREE_GB}GB free on $HOME now"
+if [ "$NO_CLEANUP" -eq 1 ]; then
+  warn "skipping Phase 5 cleanup (--no-cleanup)"
 else
-  ok "cleared pip/cargo build caches"
+  step "Phase 5: Post-install cleanup (reclaim build space)"
+  "$PY" -m pip cache purge > "$LOG_DIR/p5_cleanup.log" 2>&1 || true
+  rm -rf "$HOME/.cache/pip" 2>/dev/null
+  if [ "$KEEP_TMP" -eq 1 ]; then
+    warn "keeping scratch tmp dir (--keep-tmp): $TMPDIR"
+  else
+    rm -rf "$TMPDIR" 2>/dev/null
+  fi
+  rm -rf "$HOME/.cargo/registry" 2>/dev/null
+  _FREE_KB=$(df -P "$HOME" 2>/dev/null | awk 'NR==2 {print $4}')
+  if [ -n "$_FREE_KB" ] && [ "$_FREE_KB" -gt 0 ] 2>/dev/null; then
+    _FREE_GB=$((_FREE_KB / 1024 / 1024))
+    ok "cleared pip/cargo build caches — ~${_FREE_GB}GB free on $HOME now"
+  else
+    ok "cleared pip/cargo build caches"
+  fi
+  unset _FREE_KB _FREE_GB
 fi
-unset _FREE_KB _FREE_GB
 
 echo -e "\n${GREEN}${BOLD}All 4 phases (+cache verification +cleanup) complete.${NC}"
-echo -e "${CYAN}Launcher:${NC} "$CFG_DIR/run.sh""
-echo -e "${CYAN}Client config snippet:${NC} "$CFG_DIR/mcp_client_snippet.json""
-echo -e "${CYAN}Logs:${NC} "$LOG_DIR""
+echo -e "${CYAN}Launcher:${NC} $CFG_DIR/run.sh"
+echo -e "${CYAN}Client config snippet:${NC} $CFG_DIR/mcp_client_snippet.json"
+echo -e "${CYAN}Logs:${NC} $LOG_DIR"
