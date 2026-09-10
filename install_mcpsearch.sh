@@ -1,6 +1,6 @@
 # !/data/data/com.termux/files/usr/bin/bash
 # ============================================================================
-# MCPSearch Termux Installer — Master Script (v1.6, all 4 phases)
+# MCPSearch Termux Installer — Master Script (v1.7, all 4 phases + cleanup)
 #
 # Changelog:
 #  - v1.0: Initial 4-phase installer (clone, patch, install, self-test)
@@ -44,6 +44,22 @@
 #        broke on any other Python version (e.g. 3.14). The flag is now
 #        derived from the actual interpreter in use, so it resolves to
 #        -lpython3.14 on a 3.14 device and stays correct for everyone.
+#  - v1.7 — storage & native-build hardening:
+#      * Package-aware install tiers: C-extension packages (lxml,
+#        selectolax) now retry with CFLAGS/LDFLAGS pointing at Termux's
+#        libxml2/libxslt instead of the meaningless Rust link flag. This
+#        fixes the "lxml: retrying with rust link flags" dead-end.
+#      * Memory-safe Rust builds: CARGO_BUILD_JOBS=1 and -C opt-level=1
+#        (configurable via MCPSEARCH_RUST_OPT) prevent Android's process
+#        killer (signal 9) from terminating cargo/rustc on low-RAM phones.
+#      * Storage pre-flight check (Phase 0) warns early if free space is low.
+#      * --no-cache-dir on every pip install to stop pip's download cache
+#        from eating GBs of storage.
+#      * New Phase 5 cleanup: purges pip cache, removes scratch tmp dir,
+#        and clears cargo registry cache to reclaim build space.
+#      * Optional --no-rust flag: skips installing the Rust toolchain and
+#        the Rust-link fallback tier (for users who want prebuilt wheels
+#        only and a fast fail if one is missing).
 # ============================================================================
 set -uo pipefail
 APP_DIR="$HOME/MCPSearch"
@@ -57,6 +73,25 @@ command -v python3 >/dev/null 2>&1 || PY="python"
 # Detect the real Python version (major.minor) so the Rust link flag below
 # matches the actual interpreter, e.g. -lpython3.14 on a 3.14 device.
 PYVER=$("$PY" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || echo "3.11")
+# Termux prefix (where libxml2/libxslt headers live). Usually already set.
+PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
+
+# --- CLI flags -------------------------------------------------------------
+NO_RUST=0
+for _arg in "$@"; do
+  case "$_arg" in
+    --no-rust) NO_RUST=1 ;;
+    *) ;;
+  esac
+done
+unset _arg
+
+# Memory-safe Rust build defaults. Android's process killer (signal 9) can
+# terminate cargo/rustc when they spawn many parallel jobs and pin the CPU.
+# Cap parallelism and lower optimization to keep peak memory in check.
+# Override with MCPSEARCH_RUST_OPT=3 for faster (heavier) release builds.
+export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}"
+RUST_OPT="${MCPSEARCH_RUST_OPT:-1}"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 step(){ echo -e "\n${CYAN}▶ $*${NC}"; }
@@ -116,7 +151,22 @@ pkg_progress() {
   printf "\r\033[K"
 }
 
-echo -e "${BOLD}${CYAN}== MCPSearch Termux Installer — Phases 1-4 (v1.6) ==${NC}"
+echo -e "${BOLD}${CYAN}== MCPSearch Termux Installer — Phases 1-5 (v1.7) ==${NC}"
+
+# ---------------------------------------------------------------- PHASE 0
+step "Phase 0: Storage pre-flight check"
+_FREE_KB=$(df -P "$HOME" 2>/dev/null | awk 'NR==2 {print $4}')
+if [ -n "$_FREE_KB" ] && [ "$_FREE_KB" -gt 0 ] 2>/dev/null; then
+  _FREE_GB=$((_FREE_KB / 1024 / 1024))
+  if [ "$_FREE_GB" -lt 2 ]; then
+    warn "Only ~${_FREE_GB}GB free on $HOME. Native builds (pydantic-core, lxml) can need 2-4GB. Free space or run 'termux-setup-storage' before continuing."
+  else
+    ok "~${_FREE_GB}GB free on $HOME"
+  fi
+else
+  warn "could not determine free space on $HOME"
+fi
+unset _FREE_KB _FREE_GB
 
 # ---------------------------------------------------------------- PHASE 1
 step "Phase 1: Termux packages"
@@ -130,7 +180,12 @@ _PID=$!
 spinner "$_PID" "pkg upgrade (this can take a while)"
 if wait "$_PID"; then ok "pkg upgrade"; else warn "pkg upgrade had issues"; fi
 
-PKGS="python git rust binutils libjpeg-turbo libxml2 libxslt clang make pkg-config openssl patchelf curl"
+if [ "$NO_RUST" -eq 1 ]; then
+  warn "Rust toolchain skipped (--no-rust). Rust-based packages (pydantic-core) will only install if a prebuilt wheel exists."
+  PKGS="python git binutils libjpeg-turbo libxml2 libxslt clang make pkg-config openssl patchelf curl"
+else
+  PKGS="python git rust binutils libjpeg-turbo libxml2 libxslt clang make pkg-config openssl patchelf curl"
+fi
 set -- $PKGS
 TOTAL=$#
 CUR=0
@@ -413,11 +468,31 @@ grep -q "VERIFY_OK" "$LOG_DIR/p2_patch_httpclient.log" || fatal "http_client.py 
 step "Phase 2: Install Python dependencies (with fallback tiers)"
 install_pkg() {
   local pkg="$1"
-  timeout 60 "$PY" -m pip install --quiet --break-system-packages "$pkg" >> "$LOG_DIR/p2_pip.log" 2>&1 && return 0
+  # Tier 1: prebuilt wheel (fast, no compile). --no-cache-dir keeps pip's
+  # download cache from eating GBs of storage on constrained devices.
+  timeout 60 "$PY" -m pip install --quiet --no-cache-dir --break-system-packages "$pkg" >> "$LOG_DIR/p2_pip.log" 2>&1 && return 0
   warn "$pkg: wheel install failed, retrying --no-binary"
-  timeout 180 "$PY" -m pip install --quiet --break-system-packages --no-binary :all: "$pkg" >> "$LOG_DIR/p2_pip.log" 2>&1 && return 0
-  warn "$pkg: retrying with rust link flags (python${PYVER})"
-  RUSTFLAGS="-C link-arg=-lpython${PYVER}" timeout 240 "$PY" -m pip install --quiet --break-system-packages --force-reinstall "$pkg" >> "$LOG_DIR/p2_pip.log" 2>&1
+  # Tier 2: compile from source (no prebuilt binary).
+  timeout 180 "$PY" -m pip install --quiet --no-cache-dir --break-system-packages --no-binary :all: "$pkg" >> "$LOG_DIR/p2_pip.log" 2>&1 && return 0
+  # Tier 3: package-aware last resort.
+  case "$pkg" in
+    lxml|selectolax)
+      # C-extension packages link against Termux's libxml2/libxslt, NOT Rust.
+      # Point CFLAGS/LDFLAGS at the Termux prefix so the build finds them.
+      warn "$pkg: retrying with C library link flags (libxml2/libxslt)"
+      CFLAGS="-I$PREFIX/include" LDFLAGS="-L$PREFIX/lib" \
+      timeout 240 "$PY" -m pip install --quiet --no-cache-dir --break-system-packages --force-reinstall --no-binary :all: "$pkg" >> "$LOG_DIR/p2_pip.log" 2>&1
+      ;;
+    *)
+      if [ "$NO_RUST" -eq 1 ]; then
+        err "$pkg: needs a Rust source build but --no-rust is set; no prebuilt wheel available"
+        return 1
+      fi
+      warn "$pkg: retrying with rust link flags (python${PYVER})"
+      RUSTFLAGS="-C opt-level=${RUST_OPT} -C link-arg=-lpython${PYVER}" CARGO_BUILD_JOBS=1 \
+      timeout 300 "$PY" -m pip install --quiet --no-cache-dir --break-system-packages --force-reinstall "$pkg" >> "$LOG_DIR/p2_pip.log" 2>&1
+      ;;
+  esac
 }
 DEP_FAIL=0
 for pkg in pydantic pydantic-settings httpx beautifulsoup4 lxml selectolax mcp hishel anysqlite; do
@@ -426,7 +501,7 @@ done
 [ "$DEP_FAIL" -eq 1 ] && fatal "dependency install failed (see "$LOG_DIR/p2_pip.log")"
 
 step "Phase 2: Editable install of MCPSearch"
-timeout 120 "$PY" -m pip install --quiet --break-system-packages -e "$APP_DIR" > "$LOG_DIR/p2_editable.log" 2>&1 \
+timeout 120 "$PY" -m pip install --quiet --no-cache-dir --break-system-packages -e "$APP_DIR" > "$LOG_DIR/p2_editable.log" 2>&1 \
   && ok "editable install complete" || fatal "editable install failed (see "$LOG_DIR/p2_editable.log")"
 
 # ---------------------------------------------------------------- PHASE 3
@@ -565,7 +640,22 @@ else
   exit 1
 fi
 
-echo -e "\n${GREEN}${BOLD}All 4 phases (+cache verification) complete.${NC}"
+# ---------------------------------------------------------------- PHASE 5
+step "Phase 5: Post-install cleanup (reclaim build space)"
+"$PY" -m pip cache purge > "$LOG_DIR/p5_cleanup.log" 2>&1 || true
+rm -rf "$HOME/.cache/pip" 2>/dev/null
+rm -rf "$TMPDIR" 2>/dev/null
+rm -rf "$HOME/.cargo/registry" 2>/dev/null
+_FREE_KB=$(df -P "$HOME" 2>/dev/null | awk 'NR==2 {print $4}')
+if [ -n "$_FREE_KB" ] && [ "$_FREE_KB" -gt 0 ] 2>/dev/null; then
+  _FREE_GB=$((_FREE_KB / 1024 / 1024))
+  ok "cleared pip/cargo build caches — ~${_FREE_GB}GB free on $HOME now"
+else
+  ok "cleared pip/cargo build caches"
+fi
+unset _FREE_KB _FREE_GB
+
+echo -e "\n${GREEN}${BOLD}All 4 phases (+cache verification +cleanup) complete.${NC}"
 echo -e "${CYAN}Launcher:${NC} "$CFG_DIR/run.sh""
 echo -e "${CYAN}Client config snippet:${NC} "$CFG_DIR/mcp_client_snippet.json""
 echo -e "${CYAN}Logs:${NC} "$LOG_DIR""
