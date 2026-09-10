@@ -1,6 +1,6 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # ============================================================================
-# MCPSearch Termux Installer — Master Script (v1.8.1, all 4 phases + cleanup)
+# MCPSearch Termux Installer — Master Script (v1.9.0, all 4 phases + cleanup)
 #
 # Changelog:
 #  - v1.0: Initial 4-phase installer (clone, patch, install, self-test)
@@ -20,10 +20,21 @@
 #            (spurious unknown-option warnings), threads dynamic $APP_DIR through
 #            all embedded patch/test scripts, restricts --check to self-tests,
 #            makes --dry-run zero-side-effect, and cleans up dead code.
+#  - v1.9.0: Performance & reliability optimizations:
+#            - Prompt-free non-interactive dpkg/apt flags (--force-confdef, --force-confold).
+#            - Fast-path package checks with dpkg-query: skips already installed pkgs.
+#            - Single batch install for missing packages (eliminates 12x apt invocations).
+#            - Shallow git clone (--depth 1 --single-branch) saves network bandwidth and disk I/O.
+#            - Batch fast-path installation for pure-python wheels before fallback tiers.
 # ============================================================================
 set -uo pipefail
 
-VERSION="1.8.1"
+VERSION="1.9.0"
+
+# Set non-interactive Debian frontend and dpkg options to ensure no interactive prompts
+export DEBIAN_FRONTEND=noninteractive
+export APT_LISTCHANGES_FRONTEND=none
+DPKG_NONINTERACTIVE_OPTS="-o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold"
 
 # --- Configurable paths/env (env-overridable, then flags) ------------------
 APP_DIR="${MCPSEARCH_APP_DIR:-$HOME/MCPSearch}"
@@ -82,7 +93,7 @@ NO_HTTPBIN=0
 # --- CLI argument parsing --------------------------------------------------
 usage() {
   cat << 'HELPEOF'
-MCPSearch Termux Installer (v1.8.1)
+MCPSearch Termux Installer (v1.9.0)
 
 Usage:
   bash install_mcpsearch.sh [options]
@@ -109,7 +120,7 @@ Install behavior:
   --no-progress        Disable animated spinner/progress bars.
   --no-fail-fast       Downgrade 'fatal' errors to warnings and continue.
   --verbose            Stream command logs to the console as well as files.
-  --yes                Auto-confirm prompts (e.g. uninstall/purge).
+  --yes, -y            Auto-confirm prompts (e.g. uninstall/purge).
   --no-color           Disable ANSI colors.
   --log-level LEVEL    debug|info|warn|error (default: info).
 
@@ -221,7 +232,7 @@ while [ "$#" -gt 0 ]; do
     --cache-test-backoff=*) CACHE_TEST_BACKOFF="${1#*=}"; shift ;;
     --cache-test-interval) CACHE_TEST_INTERVAL="$2"; shift 2 ;;
     --cache-test-interval=*) CACHE_TEST_INTERVAL="${1#*=}"; shift ;;
-    *) echo "  \033[1;33m⚠\033[0m unknown option ignored: $1"; shift ;;
+    *) echo -e "  \033[1;33m⚠\033[0m unknown option ignored: $1"; shift ;;
   esac
 done
 
@@ -281,20 +292,6 @@ spinner() {
   if [ "$NO_PROGRESS" -eq 1 ]; then wait "$pid"; return; fi
   while kill -0 "$pid" 2>/dev/null; do
     printf "\r  ${CYAN}%s${NC} %s ..." "${SPIN[$((i % ${#SPIN[@]}))]}" "$msg"
-    i=$((i + 1)); sleep 0.1
-  done
-  printf "\r\033[K"
-}
-pkg_progress() {
-  local cur="$1" total="$2" name="$3" pid="$4" i=0 width=24
-  if [ "$NO_PROGRESS" -eq 1 ]; then wait "$pid"; return; fi
-  while kill -0 "$pid" 2>/dev/null; do
-    local pct=$((cur * 100 / total)) filled=$((cur * width / total)) bar="" j
-    for ((j = 0; j < width; j++)); do
-      if [ "$j" -lt "$filled" ]; then bar="${bar}█"; else bar="${bar}░"; fi
-    done
-    printf "\r  ${CYAN}%s${NC} installing %-12s ${CYAN}[%s]${NC} %3d%% (%d/%d) ..." \
-      "${SPIN[$((i % ${#SPIN[@]}))]}" "$name" "$bar" "$pct" "$cur" "$total"
     i=$((i + 1)); sleep 0.1
   done
   printf "\r\033[K"
@@ -492,37 +489,60 @@ if [ "$NO_PKG" -eq 1 ]; then
   step "Phase 1: Termux packages (skipped via --no-pkg)"
 else
   step "Phase 1: Termux packages"
+  # Clean up any interrupted dpkg states first
+  dpkg --configure -a >> "$LOG_DIR/p1.log" 2>&1 || true
+
   if [ "$NO_UPDATE" -eq 1 ]; then
     warn "skipping 'pkg update' (--no-update)"
   else
-    pkg update -y > "$LOG_DIR/p1.log" 2>&1 &
+    pkg update -y $DPKG_NONINTERACTIVE_OPTS > "$LOG_DIR/p1.log" 2>&1 &
     _PID=$!; spinner "$_PID" "pkg update"
-    if wait "$_PID"; then ok "pkg update"; else warn "pkg update had issues"; fi
+    if wait "$_PID"; then ok "pkg update"; else warn "pkg update had issues (see $LOG_DIR/p1.log)"; fi
   fi
 
   if [ "$SKIP_UPGRADE" -eq 1 ]; then
     warn "skipping 'pkg upgrade' (--skip-upgrade)"
   else
-    pkg upgrade -y >> "$LOG_DIR/p1.log" 2>&1 &
+    pkg upgrade -y $DPKG_NONINTERACTIVE_OPTS >> "$LOG_DIR/p1.log" 2>&1 &
     _PID=$!; spinner "$_PID" "pkg upgrade (this can take a while)"
-    if wait "$_PID"; then ok "pkg upgrade"; else warn "pkg upgrade had issues"; fi
+    if wait "$_PID"; then ok "pkg upgrade"; else warn "pkg upgrade had issues (see $LOG_DIR/p1.log)"; fi
   fi
 
   if [ "$NO_RUST" -eq 1 ]; then
     warn "Rust toolchain skipped (--no-rust). Rust-based packages (pydantic-core) will only install if a prebuilt wheel exists."
-    PKGS="python git binutils libjpeg-turbo libxml2 libxslt clang make pkg-config openssl patchelf curl"
+    REQ_PKGS="python git binutils libjpeg-turbo libxml2 libxslt clang make pkg-config openssl patchelf curl"
   else
-    PKGS="python git rust binutils libjpeg-turbo libxml2 libxslt clang make pkg-config openssl patchelf curl"
+    REQ_PKGS="python git rust binutils libjpeg-turbo libxml2 libxslt clang make pkg-config openssl patchelf curl"
   fi
-  set -- $PKGS
-  TOTAL=$#
-  CUR=0
-  for p in $PKGS; do
-    CUR=$((CUR + 1))
-    pkg install -y "$p" >> "$LOG_DIR/p1.log" 2>&1 &
-    _PID=$!; pkg_progress "$CUR" "$TOTAL" "$p" "$_PID"
-    if wait "$_PID"; then ok "$p"; else fatal "failed to install $p (see $LOG_DIR/p1.log)"; fi
+
+  # Optimized fast-path: detect which packages are already installed
+  MISSING_PKGS=()
+  for p in $REQ_PKGS; do
+    if dpkg-query -W -f='${Status}' "$p" 2>/dev/null | grep -q "install ok installed"; then
+      log debug "package $p is already installed"
+    else
+      MISSING_PKGS+=("$p")
+    fi
   done
+
+  if [ "${#MISSING_PKGS[@]}" -eq 0 ]; then
+    ok "all required packages already installed (${REQ_PKGS})"
+  else
+    step "Installing missing packages in a single batch: ${MISSING_PKGS[*]}"
+    pkg install -y $DPKG_NONINTERACTIVE_OPTS "${MISSING_PKGS[@]}" >> "$LOG_DIR/p1.log" 2>&1 &
+    _PID=$!; spinner "$_PID" "installing (${MISSING_PKGS[*]})"
+    if wait "$_PID"; then
+      ok "installed ${MISSING_PKGS[*]}"
+    else
+      # Fallback to individual install if batch failed, to pinpoint problem
+      warn "batch install failed, falling back to individual package checks"
+      for p in "${MISSING_PKGS[@]}"; do
+        pkg install -y $DPKG_NONINTERACTIVE_OPTS "$p" >> "$LOG_DIR/p1.log" 2>&1 &
+        _PID=$!; spinner "$_PID" "installing $p"
+        if wait "$_PID"; then ok "$p"; else fatal "failed to install $p (see $LOG_DIR/p1.log)"; fi
+      done
+    fi
+  fi
 
   if [ "$NO_ENSUREPIP" -eq 1 ]; then
     warn "skipping 'python -m ensurepip' (--no-ensurepip)"
@@ -532,7 +552,7 @@ else
   if [ "$NO_PIP_UPGRADE" -eq 1 ]; then
     warn "skipping pip upgrade (--no-pip-upgrade)"
   else
-    "$PY" -m pip install --upgrade pip --break-system-packages >> "$LOG_DIR/p1_pip.log" 2>&1 || warn "pip upgrade had issues"
+    "$PY" -m pip install --quiet --upgrade pip --break-system-packages >> "$LOG_DIR/p1_pip.log" 2>&1 || warn "pip upgrade had issues"
   fi
   ok "interpreter ready: $("$PY" --version 2>&1)"
 fi
@@ -544,15 +564,15 @@ if [ "$NO_CLONE" -eq 1 ]; then
 else
   if [ "$FORCE_REINSTALL" -eq 1 ]; then
     rm -rf "$APP_DIR"
-    git clone --branch "$BRANCH" "$REPO_URL" "$APP_DIR" > "$LOG_DIR/p2.log" 2>&1 || fatal "git clone failed (see $LOG_DIR/p2.log)"
+    git clone --depth 1 --single-branch --branch "$BRANCH" "$REPO_URL" "$APP_DIR" > "$LOG_DIR/p2.log" 2>&1 || fatal "git clone failed (see $LOG_DIR/p2.log)"
     ok "fresh clone complete (--force-reinstall) at $APP_DIR"
   elif [ -d "$APP_DIR/.git" ]; then
-    git -C "$APP_DIR" fetch origin >> "$LOG_DIR/p2.log" 2>&1
+    git -C "$APP_DIR" fetch --depth 1 origin "$BRANCH" >> "$LOG_DIR/p2.log" 2>&1
     git -C "$APP_DIR" reset --hard "origin/$BRANCH" >> "$LOG_DIR/p2.log" 2>&1
     ok "source updated at $APP_DIR"
   else
     rm -rf "$APP_DIR"
-    git clone --branch "$BRANCH" "$REPO_URL" "$APP_DIR" > "$LOG_DIR/p2.log" 2>&1 || fatal "git clone failed (see $LOG_DIR/p2.log)"
+    git clone --depth 1 --single-branch --branch "$BRANCH" "$REPO_URL" "$APP_DIR" > "$LOG_DIR/p2.log" 2>&1 || fatal "git clone failed (see $LOG_DIR/p2.log)"
   fi
 fi
 [ -f "$APP_DIR/pyproject.toml" ] && [ -f "$APP_DIR/mcp_server/server.py" ] || fatal "source tree missing expected files"
@@ -829,9 +849,26 @@ PYEOF
     || fatal "http_client.py failed to compile after patch, see $LOG_DIR/p2_patch_httpclient.log"
 fi
 
-step "Phase 2: Install Python dependencies (with fallback tiers)"
+step "Phase 2: Install Python dependencies (optimized fast batch + fallback tiers)"
+
+# Fast-path: batch install pure-Python and standard wheels in one pip resolution pass
+PURE_PYTHON_PKGS="pydantic pydantic-settings httpx beautifulsoup4 mcp hishel anysqlite"
+step "Attempting fast-path batch install for standard wheels (${PURE_PYTHON_PKGS})"
+if timeout $((TIMEOUT * 2)) "$PY" -m pip install --quiet --no-cache-dir --break-system-packages $PURE_PYTHON_PKGS >> "$LOG_DIR/p2_pip.log" 2>&1; then
+  ok "fast-path batch install successful for standard packages"
+else
+  warn "fast-path batch install had issues; will verify packages individually"
+fi
+
 install_pkg() {
   local pkg="$1"
+  # Check if package is already importable to avoid redundant work
+  local mod_name="${pkg//-/_}"
+  if "$PY" -c "import $mod_name" >/dev/null 2>&1; then
+    ok "$pkg already installed"
+    return 0
+  fi
+
   timeout "$TIMEOUT" "$PY" -m pip install --quiet --no-cache-dir --break-system-packages "$pkg" >> "$LOG_DIR/p2_pip.log" 2>&1 && return 0
   warn "$pkg: wheel install failed, retrying --no-binary"
   timeout $((TIMEOUT * 3)) "$PY" -m pip install --quiet --no-cache-dir --break-system-packages --no-binary :all: "$pkg" >> "$LOG_DIR/p2_pip.log" 2>&1 && return 0
@@ -852,6 +889,7 @@ install_pkg() {
       ;;
   esac
 }
+
 DEP_FAIL=0
 for pkg in pydantic pydantic-settings httpx beautifulsoup4 lxml selectolax mcp hishel anysqlite; do
   install_pkg "$pkg" && ok "$pkg" || { err "$pkg failed all install tiers"; DEP_FAIL=1; }
