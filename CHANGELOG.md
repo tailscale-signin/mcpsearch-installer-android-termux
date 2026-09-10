@@ -2,6 +2,17 @@
 
 All notable changes to this installer are documented here.
 
+## v1.7
+
+**Focus: storage & native-build hardening**
+
+- **Package-aware install tiers.** The last-resort pip fallback tier previously sent *every* package through the Rust link flag (`-lpython3.14`). That was meaningless for C-extension packages like `lxml`/`selectolax`, which link against Termux's `libxml2`/`libxslt` — not Rust. Those packages now retry with `CFLAGS`/`LDFLAGS` pointed at the Termux prefix instead, fixing the "lxml: retrying with rust link flags" dead-end.
+- **Memory-safe Rust builds.** `CARGO_BUILD_JOBS=1` and `-C opt-level=1` (configurable via `MCPSEARCH_RUST_OPT`) are now set for Rust source builds. This prevents Android's process killer (signal 9) from terminating `cargo`/`rustc` on low-RAM phones, which previously killed pydantic-core builds mid-compile.
+- **Storage pre-flight check (Phase 0).** Warns early if free space on `$HOME` is below ~2 GB, before the heavy native builds start.
+- **`--no-cache-dir` on every pip install.** Stops pip's download cache from silently eating GBs of storage on constrained devices.
+- **New Phase 5 cleanup.** Purges the pip cache, removes the scratch tmp dir, and clears the cargo registry cache to reclaim build space after a successful install.
+- **Optional `--no-rust` flag.** Skips installing the Rust toolchain and the Rust-link fallback tier entirely. Useful for users who want prebuilt wheels only and a fast, clear failure if a Rust-built package has no wheel.
+
 ## v1.2
 
 **Focus: hishel async HTTP cache fixes**
