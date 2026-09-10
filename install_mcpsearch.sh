@@ -1,6 +1,6 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # ============================================================================
-# MCPSearch Termux Installer — Master Script (v1.8, all 4 phases + cleanup)
+# MCPSearch Termux Installer — Master Script (v1.8.1, all 4 phases + cleanup)
 #
 # Changelog:
 #  - v1.0: Initial 4-phase installer (clone, patch, install, self-test)
@@ -14,26 +14,16 @@
 #  - v1.7: storage & native-build hardening (package-aware tiers, memory-safe
 #          Rust builds, Phase 0 storage check, --no-cache-dir, Phase 5
 #          cleanup, --no-rust flag).
-#  - v1.8: full CLI surface & runtime ergonomics:
-#      * New modes: --help, --version, --dry-run, --check, --uninstall,
-#        --purge.
-#      * New flags: --skip-upgrade, --keep-tmp, --no-cache-test,
-#        --force-reinstall, --verbose, --no-color, --yes, --no-progress,
-#        --no-fail-fast, --log-level.
-#      * Configurable paths/env: --branch, --repo-url, --prefix, --python,
-#        --app-dir, --log-dir, --config-dir, --tmp-dir.
-#      * Tuning: --timeout, --jobs, --opt-level.
-#      * Sub-step skips: --no-pkg, --no-update, --no-clone, --no-patch,
-#        --no-strip-playwright, --no-anysqlite, --no-editable,
-#        --no-ensurepip, --no-pip-upgrade, --no-selftest, --no-cleanup,
-#        --no-verify.
-#      * Cache-test overrides: --cache-test-url, --cache-test-timeout,
-#        --cache-test-retries, --cache-test-backoff, --cache-test-interval,
-#        --no-httpbin.
+#  - v1.8: full CLI surface & runtime ergonomics (modes, skips, tuning).
+#  - v1.8.1: fixes critical launcher expansion bug (unquoted heredocs for run.sh
+#            and mcp_client_snippet.json), fixes CLI option shifting bug
+#            (spurious unknown-option warnings), threads dynamic $APP_DIR through
+#            all embedded patch/test scripts, restricts --check to self-tests,
+#            makes --dry-run zero-side-effect, and cleans up dead code.
 # ============================================================================
 set -uo pipefail
 
-VERSION="1.8.0"
+VERSION="1.8.1"
 
 # --- Configurable paths/env (env-overridable, then flags) ------------------
 APP_DIR="${MCPSEARCH_APP_DIR:-$HOME/MCPSearch}"
@@ -92,7 +82,7 @@ NO_HTTPBIN=0
 # --- CLI argument parsing --------------------------------------------------
 usage() {
   cat << 'HELPEOF'
-MCPSearch Termux Installer (v1.8)
+MCPSearch Termux Installer (v1.8.1)
 
 Usage:
   bash install_mcpsearch.sh [options]
@@ -167,14 +157,6 @@ Environment variables (lower priority than flags):
 HELPEOF
 }
 
-_opt_value() {
-  # Resolves --flag VALUE or --flag=VALUE for the current $1/$2.
-  case "$1" in
-    *=*) printf '%s' "${1#*=}" ;;
-    *)   printf '%s' "$2" ;;
-  esac
-}
-
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --help) usage; exit 0 ;;
@@ -205,51 +187,48 @@ while [ "$#" -gt 0 ]; do
     --no-selftest) NO_SELFTEST=1; shift ;;
     --no-cleanup) NO_CLEANUP=1; shift ;;
     --no-verify) NO_VERIFY=1; shift ;;
-    --log-level) LOG_LEVEL="$(_opt_value "$1" "$2")"; [ "$1" = "$2" ] && shift 2 || shift ;;
+    --log-level) LOG_LEVEL="$2"; shift 2 ;;
     --log-level=*) LOG_LEVEL="${1#*=}"; shift ;;
-    --branch) BRANCH="$(_opt_value "$1" "$2")"; [ "$1" = "$2" ] && shift 2 || shift ;;
+    --branch) BRANCH="$2"; shift 2 ;;
     --branch=*) BRANCH="${1#*=}"; shift ;;
-    --repo-url) REPO_URL="$(_opt_value "$1" "$2")"; [ "$1" = "$2" ] && shift 2 || shift ;;
+    --repo-url) REPO_URL="$2"; shift 2 ;;
     --repo-url=*) REPO_URL="${1#*=}"; shift ;;
-    --app-dir) APP_DIR="$(_opt_value "$1" "$2")"; [ "$1" = "$2" ] && shift 2 || shift ;;
+    --app-dir) APP_DIR="$2"; shift 2 ;;
     --app-dir=*) APP_DIR="${1#*=}"; shift ;;
-    --log-dir) LOG_DIR="$(_opt_value "$1" "$2")"; [ "$1" = "$2" ] && shift 2 || shift ;;
+    --log-dir) LOG_DIR="$2"; shift 2 ;;
     --log-dir=*) LOG_DIR="${1#*=}"; shift ;;
-    --config-dir) CFG_DIR="$(_opt_value "$1" "$2")"; [ "$1" = "$2" ] && shift 2 || shift ;;
+    --config-dir) CFG_DIR="$2"; shift 2 ;;
     --config-dir=*) CFG_DIR="${1#*=}"; shift ;;
-    --tmp-dir) TMPDIR="$(_opt_value "$1" "$2")"; [ "$1" = "$2" ] && shift 2 || shift ;;
+    --tmp-dir) TMPDIR="$2"; shift 2 ;;
     --tmp-dir=*) TMPDIR="${1#*=}"; shift ;;
-    --prefix) PREFIX="$(_opt_value "$1" "$2")"; [ "$1" = "$2" ] && shift 2 || shift ;;
+    --prefix) PREFIX="$2"; shift 2 ;;
     --prefix=*) PREFIX="${1#*=}"; shift ;;
-    --python) PY="$(_opt_value "$1" "$2")"; [ "$1" = "$2" ] && shift 2 || shift ;;
+    --python) PY="$2"; shift 2 ;;
     --python=*) PY="${1#*=}"; shift ;;
-    --timeout) TIMEOUT="$(_opt_value "$1" "$2")"; [ "$1" = "$2" ] && shift 2 || shift ;;
+    --timeout) TIMEOUT="$2"; shift 2 ;;
     --timeout=*) TIMEOUT="${1#*=}"; shift ;;
-    --jobs) JOBS="$(_opt_value "$1" "$2")"; [ "$1" = "$2" ] && shift 2 || shift ;;
+    --jobs) JOBS="$2"; shift 2 ;;
     --jobs=*) JOBS="${1#*=}"; shift ;;
-    --opt-level) OPT_LEVEL="$(_opt_value "$1" "$2")"; [ "$1" = "$2" ] && shift 2 || shift ;;
+    --opt-level) OPT_LEVEL="$2"; shift 2 ;;
     --opt-level=*) OPT_LEVEL="${1#*=}"; shift ;;
-    --cache-test-url) CACHE_TEST_URL="$(_opt_value "$1" "$2")"; [ "$1" = "$2" ] && shift 2 || shift ;;
+    --cache-test-url) CACHE_TEST_URL="$2"; shift 2 ;;
     --cache-test-url=*) CACHE_TEST_URL="${1#*=}"; shift ;;
-    --cache-test-timeout) CACHE_TEST_TIMEOUT="$(_opt_value "$1" "$2")"; [ "$1" = "$2" ] && shift 2 || shift ;;
+    --cache-test-timeout) CACHE_TEST_TIMEOUT="$2"; shift 2 ;;
     --cache-test-timeout=*) CACHE_TEST_TIMEOUT="${1#*=}"; shift ;;
-    --cache-test-retries) CACHE_TEST_RETRIES="$(_opt_value "$1" "$2")"; [ "$1" = "$2" ] && shift 2 || shift ;;
+    --cache-test-retries) CACHE_TEST_RETRIES="$2"; shift 2 ;;
     --cache-test-retries=*) CACHE_TEST_RETRIES="${1#*=}"; shift ;;
-    --cache-test-backoff) CACHE_TEST_BACKOFF="$(_opt_value "$1" "$2")"; [ "$1" = "$2" ] && shift 2 || shift ;;
+    --cache-test-backoff) CACHE_TEST_BACKOFF="$2"; shift 2 ;;
     --cache-test-backoff=*) CACHE_TEST_BACKOFF="${1#*=}"; shift ;;
-    --cache-test-interval) CACHE_TEST_INTERVAL="$(_opt_value "$1" "$2")"; [ "$1" = "$2" ] && shift 2 || shift ;;
+    --cache-test-interval) CACHE_TEST_INTERVAL="$2"; shift 2 ;;
     --cache-test-interval=*) CACHE_TEST_INTERVAL="${1#*=}"; shift ;;
-    *) warn "unknown option ignored: $1"; shift ;;
+    *) echo "  \033[1;33m⚠\033[0m unknown option ignored: $1"; shift ;;
   esac
 done
 
-# --- Post-parse setup ------------------------------------------------------
-mkdir -p "$LOG_DIR" "$CFG_DIR" "$TMPDIR"
+# --- Python interpreter & Rust tuning defaults ------------------------------
 command -v "$PY" >/dev/null 2>&1 || { command -v python3 >/dev/null 2>&1 && PY="python3" || PY="python"; }
-# Detect the real Python version (major.minor) for the Rust link flag.
 PYVER=$("$PY" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || echo "3.11")
 
-# Memory-safe Rust build defaults.
 export CARGO_BUILD_JOBS="$JOBS"
 RUST_OPT="$OPT_LEVEL"
 
@@ -280,17 +259,6 @@ fatal(){
     warn "$* (continuing due to --no-fail-fast)"
   else
     err "$*"; echo -e "${RED}Aborted. Logs: $LOG_DIR${NC}"; exit 1
-  fi
-}
-
-# Stream-aware command runner: in verbose mode tee logs to console.
-_run(){ # _run logfile cmd...
-  local logf="$1"; shift
-  if [ "$VERBOSE" -eq 1 ]; then
-    "$@" 2>&1 | tee -a "$logf"
-    return "${PIPESTATUS[0]}"
-  else
-    "$@" >> "$logf" 2>&1
   fi
 }
 
@@ -332,7 +300,7 @@ pkg_progress() {
   printf "\r\033[K"
 }
 
-# --- Dry-run report --------------------------------------------------------
+# --- Dry-run report (strictly read-only) -----------------------------------
 if [ "$DRY_RUN" -eq 1 ]; then
   echo -e "${BOLD}${CYAN}== MCPSearch Termux Installer — DRY RUN (v$VERSION) ==${NC}"
   echo "  app-dir:      $APP_DIR"
@@ -351,6 +319,9 @@ if [ "$DRY_RUN" -eq 1 ]; then
   echo -e "${CYAN}Would run: Phase 0 storage check → Phase 1 packages → Phase 2 clone/patch/install → Phase 3 launcher → Phase 4 self-tests → Phase 5 cleanup.${NC}"
   exit 0
 fi
+
+# --- Post-parse directories (created only after --dry-run check) -----------
+mkdir -p "$LOG_DIR" "$CFG_DIR" "$TMPDIR"
 
 # --- Uninstall / purge -----------------------------------------------------
 if [ "$UNINSTALL" -eq 1 ] || [ "$PURGE" -eq 1 ]; then
@@ -375,11 +346,130 @@ fi
 
 echo -e "${BOLD}${CYAN}== MCPSearch Termux Installer — Phases 1-5 (v$VERSION) ==${NC}"
 
-# --- Check-only mode -------------------------------------------------------
+# --- Check-only mode: run Phase 4 against existing install and exit -------
 if [ "$CHECK_ONLY" -eq 1 ]; then
   step "Check mode: running Phase 4 self-tests against existing install at $APP_DIR"
   [ -d "$APP_DIR" ] || fatal "no existing install found at $APP_DIR"
-  NO_CLONE=1; NO_PATCH=1; NO_EDITABLE=1; NO_CLEANUP=1
+  [ -f "$APP_DIR/mcp_server/server.py" ] || fatal "mcp_server/server.py missing in $APP_DIR"
+
+  # Phase 4 self-test
+  cat > "$TMPDIR/mcpsearch_selftest.py" << 'TESTEOF'
+import sys, os, asyncio, traceback
+
+sys.path.insert(0, "__APP_DIR__")
+
+def fail(msg, exc=None):
+    print(f"SELFTEST_FAIL: {msg}")
+    if exc:
+        traceback.print_exc()
+    sys.exit(1)
+
+try:
+    from mcp_server import server as srv
+except Exception as e:
+    fail("could not import mcp_server.server", e)
+
+try:
+    tool_names = sorted(getattr(t, "name", str(t)) for t in srv.mcp._tool_manager._tools.values()) \
+        if hasattr(srv, "mcp") else []
+    print(f"SELFTEST_INFO: discovered {len(tool_names)} tools")
+    for n in tool_names:
+        print("   -", n)
+except Exception as e:
+    print(f"SELFTEST_WARN: could not enumerate tools cleanly ({e})")
+
+async def run_smoke_call():
+    if hasattr(srv, "get_crawl_stats"):
+        try:
+            result = await srv.get_crawl_stats.fn() if hasattr(srv.get_crawl_stats, "fn") else await srv.get_crawl_stats()
+            print("SELFTEST_INFO: get_crawl_stats() returned:", str(result)[:200])
+        except Exception as e:
+            fail("get_crawl_stats() raised an exception", e)
+    else:
+        print("SELFTEST_WARN: get_crawl_stats not found, skipping smoke call")
+
+try:
+    asyncio.run(run_smoke_call())
+except SystemExit:
+    raise
+except Exception as e:
+    fail("smoke call crashed unexpectedly", e)
+
+print("SELFTEST_PASS")
+TESTEOF
+  sed -i "s|__APP_DIR__|${APP_DIR}|g" "$TMPDIR/mcpsearch_selftest.py"
+  if "$PY" "$TMPDIR/mcpsearch_selftest.py" 2>&1 | tee "$LOG_DIR/p4_selftest.log" | grep -q "SELFTEST_PASS"; then
+    ok "self-test passed — server imports and responds to a tool call cleanly"
+  else
+    err "self-test FAILED — see $LOG_DIR/p4_selftest.log for the full traceback"
+    exit 1
+  fi
+
+  if [ "$NO_CACHE_TEST" -eq 1 ]; then
+    warn "skipping Phase 4b HTTP cache smoke test (--no-cache-test)"
+  else
+    step "Phase 4b: HTTP cache smoke test (hishel + anysqlite, no deprecation warnings)"
+    cat > "$TMPDIR/mcpsearch_cache_selftest.py" << 'CACHETESTEOF'
+import sys, os, asyncio, warnings, traceback
+
+sys.path.insert(0, "__APP_DIR__")
+
+def fail(msg, exc=None):
+    print(f"CACHETEST_FAIL: {msg}")
+    if exc:
+        traceback.print_exc()
+    sys.exit(1)
+
+async def main():
+    try:
+        from utils.http_client import build_async_client, AsyncHttpClientConfig
+    except Exception as e:
+        fail("could not import build_async_client/AsyncHttpClientConfig", e)
+        return
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)
+        try:
+            config = AsyncHttpClientConfig(enable_cache=True, cache_ttl=60, always_cache=True)
+            client = build_async_client(config)
+        except UserWarning as e:
+            fail(f"deprecated-kwarg UserWarning still present: {e}")
+            return
+        except Exception as e:
+            fail("build_async_client() raised unexpectedly", e)
+            return
+
+    try:
+        r1 = await client.get("__CACHE_TEST_URL__")
+        r2 = await client.get("__CACHE_TEST_URL__")
+        await client.aclose()
+    except Exception as e:
+        fail("cached client GET request failed (network or hishel wiring issue)", e)
+        return
+
+    hit1 = r1.extensions.get("hishel_from_cache")
+    hit2 = r2.extensions.get("hishel_from_cache")
+    print(f"CACHETEST_INFO: req1 hishel_from_cache={hit1}, req2 hishel_from_cache={hit2}")
+
+    if hit2 is not True:
+        fail(f"expected req2 hishel_from_cache=True under always_cache=True, got {hit2}")
+        return
+
+    print("CACHETEST_PASS")
+
+asyncio.run(main())
+CACHETESTEOF
+    sed -i "s|__APP_DIR__|${APP_DIR}|g" "$TMPDIR/mcpsearch_cache_selftest.py"
+    sed -i "s|__CACHE_TEST_URL__|${CACHE_TEST_URL}|g" "$TMPDIR/mcpsearch_cache_selftest.py"
+    if "$PY" "$TMPDIR/mcpsearch_cache_selftest.py" 2>&1 | tee "$LOG_DIR/p4b_cache_selftest.log" | grep -q "CACHETEST_PASS"; then
+      ok "HTTP cache self-test passed — hishel/anysqlite wired correctly, no deprecation warnings"
+    else
+      err "HTTP cache self-test FAILED — see $LOG_DIR/p4b_cache_selftest.log for the full traceback"
+      exit 1
+    fi
+  fi
+  ok "Check complete. Install at $APP_DIR verified."
+  exit 0
 fi
 
 # ---------------------------------------------------------------- PHASE 0
@@ -502,7 +592,7 @@ else
   cat > "$TMPDIR/mcpsearch_patch.py" << 'PYEOF'
 import re, sys, os
 
-path = os.path.expanduser("~/MCPSearch/mcp_server/server.py")
+path = os.path.join("__APP_DIR__", "mcp_server", "server.py")
 with open(path, encoding="utf-8") as f:
     src = f.read()
 orig = src
@@ -692,6 +782,7 @@ if "get_research_agent_instance" in src:
     sys.exit(1)
 print("VERIFY_OK: patch script completed without fatal issues")
 PYEOF
+  sed -i "s|__APP_DIR__|${APP_DIR}|g" "$TMPDIR/mcpsearch_patch.py"
   "$PY" "$TMPDIR/mcpsearch_patch.py" 2>&1 | tee "$LOG_DIR/p2_patch.log"
   if [ "$NO_VERIFY" -eq 1 ]; then
     ok "server.py patch script completed (verification skipped)"
@@ -704,7 +795,7 @@ PYEOF
   cat > "$TMPDIR/mcpsearch_patch_httpclient.py" << 'PYEOF'
 import re, os
 
-path = os.path.expanduser("~/MCPSearch/utils/http_client.py")
+path = os.path.join("__APP_DIR__", "utils", "http_client.py")
 if not os.path.exists(path):
     print("SKIP: utils/http_client.py not found (nothing to patch)")
 else:
@@ -726,6 +817,7 @@ else:
         print("NOOP: no deprecated refresh_ttl_on_access kwarg found (already clean or never present)")
 print("VERIFY_OK: http_client.py patch script completed")
 PYEOF
+  sed -i "s|__APP_DIR__|${APP_DIR}|g" "$TMPDIR/mcpsearch_patch_httpclient.py"
   "$PY" "$TMPDIR/mcpsearch_patch_httpclient.py" 2>&1 | tee "$LOG_DIR/p2_patch_httpclient.log"
   if [ "$NO_VERIFY" -eq 1 ]; then
     ok "http_client.py patch script completed (verification skipped)"
@@ -780,7 +872,8 @@ fi
 
 # ---------------------------------------------------------------- PHASE 3
 step "Phase 3: Generate launcher and MCP client config"
-cat > "$CFG_DIR/run.sh" << 'LAUNCHER_EOF'
+# Heredoc must be UNQUOTED so $APP_DIR, $PY, $CFG_DIR expand at generation time.
+cat > "$CFG_DIR/run.sh" << LAUNCHER_EOF
 #!/data/data/com.termux/files/usr/bin/bash
 cd "$APP_DIR" || exit 1
 exec $PY -m mcp_server
@@ -788,7 +881,7 @@ LAUNCHER_EOF
 chmod +x "$CFG_DIR/run.sh"
 ok "launcher written to $CFG_DIR/run.sh"
 
-cat > "$CFG_DIR/mcp_client_snippet.json" << 'JSONEOF'
+cat > "$CFG_DIR/mcp_client_snippet.json" << JSONEOF
 {
   "mcpServers": {
     "mcpsearch": {
@@ -809,7 +902,7 @@ else
   cat > "$TMPDIR/mcpsearch_selftest.py" << 'TESTEOF'
 import sys, os, asyncio, traceback
 
-sys.path.insert(0, os.path.expanduser("~/MCPSearch"))
+sys.path.insert(0, "__APP_DIR__")
 
 def fail(msg, exc=None):
     print(f"SELFTEST_FAIL: {msg}")
@@ -850,6 +943,7 @@ except Exception as e:
 
 print("SELFTEST_PASS")
 TESTEOF
+  sed -i "s|__APP_DIR__|${APP_DIR}|g" "$TMPDIR/mcpsearch_selftest.py"
   if "$PY" "$TMPDIR/mcpsearch_selftest.py" 2>&1 | tee "$LOG_DIR/p4_selftest.log" | grep -q "SELFTEST_PASS"; then
     ok "self-test passed — server imports and responds to a tool call cleanly"
   else
@@ -865,7 +959,7 @@ TESTEOF
     cat > "$TMPDIR/mcpsearch_cache_selftest.py" << 'CACHETESTEOF'
 import sys, os, asyncio, warnings, traceback
 
-sys.path.insert(0, os.path.expanduser("~/MCPSearch"))
+sys.path.insert(0, "__APP_DIR__")
 
 def fail(msg, exc=None):
     print(f"CACHETEST_FAIL: {msg}")
@@ -912,7 +1006,8 @@ async def main():
 
 asyncio.run(main())
 CACHETESTEOF
-    # Substitute cache-test overrides into the generated test.
+    # Substitute dynamic app-dir and cache-test URL into the generated test.
+    sed -i "s|__APP_DIR__|${APP_DIR}|g" "$TMPDIR/mcpsearch_cache_selftest.py"
     sed -i "s|__CACHE_TEST_URL__|${CACHE_TEST_URL}|g" "$TMPDIR/mcpsearch_cache_selftest.py"
     if "$PY" "$TMPDIR/mcpsearch_cache_selftest.py" 2>&1 | tee "$LOG_DIR/p4b_cache_selftest.log" | grep -q "CACHETEST_PASS"; then
       ok "HTTP cache self-test passed — hishel/anysqlite wired correctly, no deprecation warnings"
