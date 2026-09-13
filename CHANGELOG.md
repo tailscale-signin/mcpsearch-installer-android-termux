@@ -2,6 +2,16 @@
 
 All notable changes to this installer are documented here.
 
+## v2.0.0
+
+**Focus: Search & Crawl Suite Expansion (Companion Tools & Unified Multi-Server Config)**
+
+- **Global GitHub Code Search Companion (`grep-mcp`):** Added native support for `grep-mcp` via `--with-grep` or `--bundle`. Allows MCP agents to execute regex and AST code queries across 500k+ GitHub repositories via grep.app without requiring GitHub API tokens or hitting rate limits. Generates a standalone launcher `$CFG_DIR/run_grep.sh`.
+- **Headless Content Extraction Companion (`trafilatura`):** Added `--with-crawler` or `--bundle` to install `trafilatura`, providing clean, resilient HTML-to-text/markdown web content extraction without needing headless Chromium or Playwright on Android.
+- **Unified Multi-MCP Configuration Generator:** When companion tools are selected, the installer automatically outputs a combined `mcp_client_snippet.json` containing `mcpsearch`, `grep-code-search`, and `trafilatura-extract` with concrete paths ready to drop into Claude Desktop, Cursor, Roo Code, Cline, or LibreChat.
+- **Extended Self-Tests:** Phase 4 self-tests now automatically discover and verify companion server imports alongside the MCPSearch core server.
+- **Installer CLI Enhancements:** Added `--with-grep`, `--with-crawler`, `--bundle`, and `--all` flags, with corresponding `MCPSEARCH_WITH_GREP` and `MCPSEARCH_WITH_CRAWLER` environment variables.
+
 ## v1.9.2
 
 **Focus: Termux community ecosystem optimizations & background resilience**
