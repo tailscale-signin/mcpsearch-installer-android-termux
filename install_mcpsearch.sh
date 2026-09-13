@@ -1,6 +1,6 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # ============================================================================
-# MCPSearch Termux Installer — Master Script (v1.9.0, optimized & hardened)
+# MCPSearch Termux Installer — Master Script (v1.9.1, optimized & hardened)
 #
 # Changelog:
 #  - v1.0: Initial 4-phase installer (clone, patch, install, self-test)
@@ -27,10 +27,16 @@
 #            - Native python-lxml integration to bypass slow C compilation.
 #            - Shallow git clones (--depth 1 --single-branch) saving bandwidth and I/O.
 #            - Fast-path batch pip wheel installation with tier fallback.
+#  - v1.9.1: Fixes for Termux linker warnings and Rust/Pydantic build pipeline:
+#            - Run sleep in spinner with 'env -u LD_PRELOAD' to eliminate linker
+#              warnings during termux-exec upgrades.
+#            - Pre-install maturin and export RUSTFLAGS/PYO3_PYTHON upfront.
+#            - Fix install_pkg tiering to prevent premature unflagged --no-binary
+#              hangs on pydantic/pydantic-core and extend build timeouts for mobile CPUs.
 # ============================================================================
 set -uo pipefail
 
-VERSION="1.9.0"
+VERSION="1.9.1"
 
 # Enforce non-interactive package operations to avoid background subshell hangs
 export DEBIAN_FRONTEND=noninteractive
@@ -93,7 +99,7 @@ NO_HTTPBIN=0
 # --- CLI argument parsing --------------------------------------------------
 usage() {
   cat << 'HELPEOF'
-MCPSearch Termux Installer (v1.9.0)
+MCPSearch Termux Installer (v1.9.1)
 
 Usage:
   bash install_mcpsearch.sh [options]
@@ -292,7 +298,8 @@ spinner() {
   if [ "$NO_PROGRESS" -eq 1 ]; then wait "$pid"; return; fi
   while kill -0 "$pid" 2>/dev/null; do
     printf "\r  ${CYAN}%s${NC} %s ..." "${SPIN[$((i % ${#SPIN[@]}))]}" "$msg"
-    i=$((i + 1)); sleep 0.1
+    i=$((i + 1))
+    env -u LD_PRELOAD sleep 0.1 2>/dev/null || true
   done
   printf "\r\033[K"
 }
@@ -512,12 +519,12 @@ else
   # Attempt fixing broken dependencies if any were left in a partial state
   apt-get --fix-broken install $APT_DPKG_FLAGS >> "$LOG_DIR/p1.log" 2>&1 || true
 
-  # Pre-packaged native python-lxml saves 5-10 minutes of compiling from source
+  # Pre-packaged native python-lxml & python-maturin save significant compile time from source
   if [ "$NO_RUST" -eq 1 ]; then
     warn "Rust toolchain skipped (--no-rust). Rust-based packages (pydantic-core) will only install if a prebuilt wheel exists."
-    REQ_PKGS="python python-lxml git binutils libjpeg-turbo libxml2 libxslt clang make pkg-config openssl patchelf curl"
+    REQ_PKGS="python python-lxml python-maturin git binutils libjpeg-turbo libxml2 libxslt clang make pkg-config openssl patchelf curl"
   else
-    REQ_PKGS="python python-lxml git rust binutils libjpeg-turbo libxml2 libxslt clang make pkg-config openssl patchelf curl"
+    REQ_PKGS="python python-lxml python-maturin git rust binutils libjpeg-turbo libxml2 libxslt clang make pkg-config openssl patchelf curl"
   fi
 
   # Optimized Batch Detection: Only install packages that are not yet installed
@@ -537,7 +544,7 @@ else
     if wait "$_PID"; then
       ok "installed packages:$MISSING_PKGS"
     else
-      # If python-lxml fails because it might not be in all repos, fall back to base packages
+      # If optional packages fail, fall back to individual package installs
       warn "batch install had issues, retrying individual essential packages"
       for p in $REQ_PKGS; do
         if ! dpkg -s "$p" >/dev/null 2>&1; then
@@ -854,6 +861,15 @@ fi
 
 step "Phase 2: Install Python dependencies (optimized batch + fallback tiers)"
 
+# Set build flags for native/Rust packages upfront so all pip invocations inherit them
+if [ "$NO_RUST" -eq 0 ]; then
+  export RUSTFLAGS="-C opt-level=${RUST_OPT} -C link-arg=-lpython${PYVER} -L${PREFIX}/lib"
+  export PYO3_PYTHON="$PY"
+  export CARGO_BUILD_JOBS="$JOBS"
+  # Pre-install maturin to speed up pyproject.toml Rust builds
+  "$PY" -m pip install --quiet --no-cache-dir --break-system-packages "maturin>=1.5,<2.0" >> "$LOG_DIR/p2_pip.log" 2>&1 || true
+fi
+
 # Fast-path: batch wheel install of dependencies
 PY_DEPS="pydantic pydantic-settings httpx beautifulsoup4 lxml selectolax mcp hishel anysqlite"
 
@@ -869,29 +885,47 @@ install_pkg() {
     return 0
   fi
 
+  # Tier 1: Standard pip install (prebuilt wheel or quick build)
   timeout "$TIMEOUT" "$PY" -m pip install --quiet --no-cache-dir --break-system-packages "$pkg" >> "$LOG_DIR/p2_pip.log" 2>&1 && return 0
-  warn "$pkg: wheel install failed, retrying --no-binary"
-  timeout $((TIMEOUT * 3)) "$PY" -m pip install --quiet --no-cache-dir --break-system-packages --no-binary :all: "$pkg" >> "$LOG_DIR/p2_pip.log" 2>&1 && return 0
+
+  # Tier 2: Package-specific build with appropriate compiler & link flags
   case "$pkg" in
     lxml|selectolax)
-      warn "$pkg: retrying with C library link flags (libxml2/libxslt)"
+      warn "$pkg: wheel install failed, retrying with C library flags (libxml2/libxslt)"
       CFLAGS="-I$PREFIX/include" LDFLAGS="-L$PREFIX/lib" \
       timeout $((TIMEOUT * 4)) "$PY" -m pip install --quiet --no-cache-dir --break-system-packages --force-reinstall --no-binary :all: "$pkg" >> "$LOG_DIR/p2_pip.log" 2>&1
       ;;
-    *)
+    pydantic|pydantic-settings|pydantic-core)
       if [ "$NO_RUST" -eq 1 ]; then
-        err "$pkg: needs a Rust source build but --no-rust is set; no prebuilt wheel available"
+        err "$pkg: requires Rust toolchain for pydantic-core but --no-rust is set"
         return 1
       fi
-      warn "$pkg: retrying with rust link flags (python${PYVER})"
-      RUSTFLAGS="-C opt-level=${RUST_OPT} -C link-arg=-lpython${PYVER}" CARGO_BUILD_JOBS="$JOBS" \
-      timeout $((TIMEOUT * 5)) "$PY" -m pip install --quiet --no-cache-dir --break-system-packages --force-reinstall "$pkg" >> "$LOG_DIR/p2_pip.log" 2>&1
+      warn "$pkg: standard install failed, retrying with Rust/PyO3 flags"
+      RUSTFLAGS="-C opt-level=${RUST_OPT} -C link-arg=-lpython${PYVER} -L${PREFIX}/lib" \
+      PYO3_PYTHON="$PY" CARGO_BUILD_JOBS="$JOBS" \
+      timeout $((TIMEOUT * 6)) "$PY" -m pip install --quiet --no-cache-dir --break-system-packages --no-binary pydantic-core "$pkg" >> "$LOG_DIR/p2_pip.log" 2>&1 && return 0
+      # Fallback to full source build with Rust flags
+      RUSTFLAGS="-C opt-level=${RUST_OPT} -C link-arg=-lpython${PYVER} -L${PREFIX}/lib" \
+      PYO3_PYTHON="$PY" CARGO_BUILD_JOBS="$JOBS" \
+      timeout $((TIMEOUT * 6)) "$PY" -m pip install --quiet --no-cache-dir --break-system-packages --force-reinstall --no-binary :all: "$pkg" >> "$LOG_DIR/p2_pip.log" 2>&1
+      ;;
+    *)
+      warn "$pkg: wheel install failed, retrying --no-binary :all:"
+      timeout $((TIMEOUT * 3)) "$PY" -m pip install --quiet --no-cache-dir --break-system-packages --no-binary :all: "$pkg" >> "$LOG_DIR/p2_pip.log" 2>&1 && return 0
+      if [ "$NO_RUST" -eq 0 ]; then
+        warn "$pkg: retrying with Rust link flags (python${PYVER})"
+        RUSTFLAGS="-C opt-level=${RUST_OPT} -C link-arg=-lpython${PYVER} -L${PREFIX}/lib" \
+        PYO3_PYTHON="$PY" CARGO_BUILD_JOBS="$JOBS" \
+        timeout $((TIMEOUT * 6)) "$PY" -m pip install --quiet --no-cache-dir --break-system-packages --force-reinstall "$pkg" >> "$LOG_DIR/p2_pip.log" 2>&1
+      else
+        return 1
+      fi
       ;;
   esac
 }
 
 # Attempt fast batch install first
-timeout $((TIMEOUT * 2)) "$PY" -m pip install --quiet --no-cache-dir --break-system-packages $PY_DEPS >> "$LOG_DIR/p2_pip.log" 2>&1 &
+timeout $((TIMEOUT * 4)) "$PY" -m pip install --quiet --no-cache-dir --break-system-packages $PY_DEPS >> "$LOG_DIR/p2_pip.log" 2>&1 &
 _PID=$!; spinner "$_PID" "resolving python dependencies"
 wait "$_PID" || true
 
