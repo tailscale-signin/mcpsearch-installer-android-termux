@@ -1,6 +1,6 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # ============================================================================
-# MCPSearch Termux Installer — Master Script (v2.1.0: Python 3.11 & Search Suite)
+# MCPSearch Termux Installer — Master Script (v2.1.1: Python 3.11 & Search Suite)
 #
 # Changelog:
 #  - v1.0: Initial 4-phase installer (clone, patch, install, self-test)
@@ -30,16 +30,16 @@
 #            - Unified MCP multi-server configuration generator combining
 #              mcpsearch, grep-code-search, and web-crawler in one snippet.
 #            - Self-test extensions verifying companion server readiness.
-#  - v2.1.0: Strict Python 3.11 enforcement & TUR wheel optimization:
-#            - Pinned default interpreter to Python 3.11 via TUR to bypass
-#              Rust build failures on bleeding-edge Python 3.14.
-#            - Auto-installs tur-repo and python3.11 when needed.
-#            - Uses --prefer-binary flag to prevent unnecessary source compiles.
-#            - Employs absolute interpreter paths in all generated launchers.
+#  - v2.1.0: Strict Python 3.11 enforcement & TUR wheel optimization.
+#  - v2.1.1: Platform tag fix for Termux bionic/glibc wheels:
+#            - TUR wheels for Python 3.11 are tagged 'linux_aarch64'.
+#            - Termux's pip requires --extra-index-url and direct wheel URL
+#              fallback if pip tag check flags bionic libc mismatch.
+#            - Auto-fetches and installs direct TUR wheels for pydantic-core.
 # ============================================================================
 set -uo pipefail
 
-VERSION="2.1.0"
+VERSION="2.1.1"
 
 # Enforce non-interactive package operations to avoid background subshell hangs
 export DEBIAN_FRONTEND=noninteractive
@@ -119,7 +119,7 @@ TUR_PYPI_INDEX="https://termux-user-repository.github.io/pypi/"
 # --- CLI argument parsing --------------------------------------------------
 usage() {
   cat << 'HELPEOF'
-MCPSearch Termux Installer (v2.1.0 — Python 3.11 & Search Suite)
+MCPSearch Termux Installer (v2.1.1 — Python 3.11 & Search Suite)
 
 Usage:
   bash install_mcpsearch.sh [options]
@@ -953,14 +953,35 @@ if [ "$USE_TUR" -eq 1 ]; then
   ok "TUR community PyPI index enabled ($TUR_PYPI_INDEX)"
 fi
 
+# Helper: Detect Android CPU architecture for TUR wheel mapping
+ARCH_RAW="$(uname -m 2>/dev/null || echo 'aarch64')"
+case "$ARCH_RAW" in
+  aarch64|arm64) TUR_ARCH="linux_aarch64" ;;
+  armv7l|arm)    TUR_ARCH="linux_armv7l" ;;
+  x86_64)        TUR_ARCH="linux_x86_64" ;;
+  *)             TUR_ARCH="linux_aarch64" ;;
+esac
+
 # Pre-install maturin upfront if Rust is enabled
 if [ "$NO_RUST" -eq 0 ]; then
   "$PY_CMD" -m pip install --quiet --no-cache-dir --break-system-packages --prefer-binary $TUR_INDEX_ARG "maturin>=1.5,<2.0" >> "$LOG_DIR/p2_pip.log" 2>&1 || true
 fi
 
-# Pre-install pydantic-core from TUR prebuilt wheels to prevent Rust compilation hangs
-if [ "$USE_TUR" -eq 1 ]; then
-  "$PY_CMD" -m pip install --quiet --no-cache-dir --break-system-packages --prefer-binary $TUR_INDEX_ARG "pydantic-core" >> "$LOG_DIR/p2_pip.log" 2>&1 || true
+# Direct installation of pydantic-core wheel from TUR repository if available
+if [ "$USE_TUR" -eq 1 ] && ! "$PY_CMD" -c "import pydantic_core" >/dev/null 2>&1; then
+  TUR_CORE_URL="https://termux-user-repository.github.io/pypi/pydantic-core/pydantic_core-2.27.2-cp311-cp311-${TUR_ARCH}.whl"
+  # Download directly into tmp and attempt install (handling pip wheel tag compatibility)
+  if curl -fsSL "$TUR_CORE_URL" -o "$TMPDIR/pydantic_core_tur.whl" 2>/dev/null; then
+    # First try direct install
+    if ! "$PY_CMD" -m pip install --no-cache-dir --break-system-packages "$TMPDIR/pydantic_core_tur.whl" >> "$LOG_DIR/p2_pip.log" 2>&1; then
+      # If rejected due to platform tag (e.g. bionic vs linux_aarch64), adjust tag to any or current platform
+      _CUR_TAG=$("$PY_CMD" -c 'import packaging.tags as t; print(list(t.sys_tags())[0])' 2>/dev/null || echo "")
+      if [ -n "$_CUR_TAG" ]; then
+        mv "$TMPDIR/pydantic_core_tur.whl" "$TMPDIR/pydantic_core-2.27.2-${_CUR_TAG}.whl" 2>/dev/null || true
+        "$PY_CMD" -m pip install --no-cache-dir --break-system-packages "$TMPDIR"/pydantic_core-2.27.2-*.whl >> "$LOG_DIR/p2_pip.log" 2>&1 || true
+      fi
+    fi
+  fi
 fi
 
 # Primary Python dependencies
@@ -998,6 +1019,12 @@ install_pkg() {
       return 1
       ;;
     pydantic|pydantic-settings|pydantic-core)
+      # Check if pydantic_core is already installed
+      if "$PY_CMD" -c "import pydantic_core" >/dev/null 2>&1; then
+        warn "$pkg: pydantic_core is available, installing pure-python wrapper with --no-deps"
+        timeout $((TIMEOUT * 2)) "$PY_CMD" -m pip install --quiet --no-cache-dir --break-system-packages --no-deps "$pkg" >> "$LOG_DIR/p2_pip.log" 2>&1 && return 0
+      fi
+
       if [ "$NO_RUST" -eq 1 ]; then
         err "$pkg: requires Rust toolchain for pydantic-core but --no-rust is set"
         return 1
