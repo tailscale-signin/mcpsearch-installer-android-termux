@@ -1,6 +1,6 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # ============================================================================
-# MCPSearch Termux Installer — Master Script (v1.9.2, optimized & hardened)
+# MCPSearch Termux Installer — Master Script (v2.0.0: Search & Crawl Suite)
 #
 # Changelog:
 #  - v1.0: Initial 4-phase installer (clone, patch, install, self-test)
@@ -15,36 +15,25 @@
 #          Rust builds, Phase 0 storage check, --no-cache-dir, Phase 5
 #          cleanup, --no-rust flag).
 #  - v1.8: full CLI surface & runtime ergonomics (modes, skips, tuning).
-#  - v1.8.1: fixes critical launcher expansion bug (unquoted heredocs for run.sh
-#            and mcp_client_snippet.json), fixes CLI option shifting bug
-#            (spurious unknown-option warnings), threads dynamic $APP_DIR through
-#            all embedded patch/test scripts, restricts --check to self-tests,
-#            makes --dry-run zero-side-effect, and cleans up dead code.
-#  - v1.9.0: Performance & reliability optimizations:
-#            - Non-interactive Dpkg environment (--force-confdef, --force-confold)
-#              preventing background subshell crashes on config prompts.
-#            - Batch package detection & installation (cuts Phase 1 from 5m to seconds).
-#            - Native python-lxml integration to bypass slow C compilation.
-#            - Shallow git clones (--depth 1 --single-branch) saving bandwidth and I/O.
-#            - Fast-path batch pip wheel installation with tier fallback.
-#  - v1.9.1: Fixes for Termux linker warnings and Rust/Pydantic build pipeline:
-#            - Run sleep in spinner with 'env -u LD_PRELOAD' to eliminate linker
-#              warnings during termux-exec upgrades.
-#            - Pre-install maturin and export RUSTFLAGS/PYO3_PYTHON upfront.
-#            - Fix install_pkg tiering to prevent premature unflagged --no-binary
-#              hangs on pydantic/pydantic-core and extend build timeouts for mobile CPUs.
-#  - v1.9.2: Community optimizations for Android / Termux:
-#            - TUR (Termux User Repository) PyPI index integration: enables instant
-#              prebuilt wheels for pydantic-core, lxml, and maturin, avoiding
-#              costly native compilation on battery/mobile CPUs.
-#            - Graceful selectolax soft-fallback: allows upstream BeautifulSoup4+lxml
-#              hot-path fallback if selectolax compilation fails.
-#            - Background execution resilience: optional termux-wake-lock support
-#              in generated launcher to prevent Android process suspension.
+#  - v1.8.1: fixes critical launcher expansion bug, CLI option shifting,
+#            threads dynamic $APP_DIR, zero-side-effect --dry-run.
+#  - v1.9.0: Dpkg non-interactive mode, batch package install, python-lxml
+#            native integration, shallow git clones, fast pip wheel batching.
+#  - v1.9.1: env -u LD_PRELOAD in spinner to eliminate linker warnings,
+#            pre-install maturin and export RUSTFLAGS/PYO3_PYTHON upfront.
+#  - v1.9.2: TUR PyPI index integration for prebuilt Android wheels,
+#            graceful selectolax soft-fallback, termux-wake-lock support.
+#  - v2.0.0: Multi-Server Search & Crawl Suite release:
+#            - Optional companion tools: Global GitHub code search (grep-mcp)
+#              and resilient headless web extraction/crawler (trafilatura).
+#            - CLI flags: --with-grep, --with-crawler, and --bundle.
+#            - Unified MCP multi-server configuration generator combining
+#              mcpsearch, grep-code-search, and web-crawler in one snippet.
+#            - Self-test extensions verifying companion server readiness.
 # ============================================================================
 set -uo pipefail
 
-VERSION="1.9.2"
+VERSION="2.0.0"
 
 # Enforce non-interactive package operations to avoid background subshell hangs
 export DEBIAN_FRONTEND=noninteractive
@@ -79,6 +68,10 @@ LOG_LEVEL="info"
 USE_TUR="${MCPSEARCH_USE_TUR:-1}"
 WAKE_LOCK="${MCPSEARCH_WAKE_LOCK:-1}"
 
+# Companion Search & Crawl Suite toggles (v2.0.0)
+WITH_GREP="${MCPSEARCH_WITH_GREP:-0}"
+WITH_CRAWLER="${MCPSEARCH_WITH_CRAWLER:-0}"
+
 # Tuning defaults
 TIMEOUT=60
 JOBS="${CARGO_BUILD_JOBS:-1}"
@@ -112,7 +105,7 @@ TUR_PYPI_INDEX="https://termux-user-repository.github.io/pypi/"
 # --- CLI argument parsing --------------------------------------------------
 usage() {
   cat << 'HELPEOF'
-MCPSearch Termux Installer (v1.9.2)
+MCPSearch Termux Installer (v2.0.0 — Search & Crawl Suite)
 
 Usage:
   bash install_mcpsearch.sh [options]
@@ -128,6 +121,14 @@ Modes:
                        artifacts (launcher, config snippet, source tree).
   --purge              Like --uninstall but also removes logs, config dir, and
                        the scratch tmp dir.
+
+Search & Crawl Suite (v2.0.0):
+  --with-grep          Install 'grep-mcp' for fast, keyless code search across
+                       500k+ GitHub repositories.
+  --with-crawler       Install 'trafilatura' for clean, headless web content
+                       and article extraction.
+  --bundle, --all      Install MCPSearch + grep-mcp + web crawler companion tools
+                       and generate a unified multi-server client config.
 
 Install behavior:
   --skip-upgrade       Skip 'pkg upgrade' (the slowest step).
@@ -185,7 +186,8 @@ Cache test overrides (Phase 4b):
 Environment variables (lower priority than flags):
   MCPSEARCH_APP_DIR, MCPSEARCH_LOG_DIR, MCPSEARCH_CONFIG_DIR,
   MCPSEARCH_TMP_DIR, MCPSEARCH_REPO_URL, MCPSEARCH_BRANCH, MCPSEARCH_PYTHON,
-  MCPSEARCH_RUST_OPT, CARGO_BUILD_JOBS, MCPSEARCH_USE_TUR, MCPSEARCH_WAKE_LOCK
+  MCPSEARCH_RUST_OPT, CARGO_BUILD_JOBS, MCPSEARCH_USE_TUR, MCPSEARCH_WAKE_LOCK,
+  MCPSEARCH_WITH_GREP, MCPSEARCH_WITH_CRAWLER
 HELPEOF
 }
 
@@ -197,6 +199,9 @@ while [ "$#" -gt 0 ]; do
     --check) CHECK_ONLY=1; shift ;;
     --uninstall) UNINSTALL=1; shift ;;
     --purge) PURGE=1; shift ;;
+    --with-grep|--grep) WITH_GREP=1; shift ;;
+    --with-crawler|--crawler) WITH_CRAWLER=1; shift ;;
+    --bundle|--all) WITH_GREP=1; WITH_CRAWLER=1; shift ;;
     --skip-upgrade) SKIP_UPGRADE=1; shift ;;
     --force-reinstall) FORCE_REINSTALL=1; shift ;;
     --keep-tmp) KEEP_TMP=1; shift ;;
@@ -286,8 +291,8 @@ log() { # log LEVEL msg
 
 step(){ log info "\n${CYAN}▶ $*${NC}"; }
 ok(){ log info "  ${GREEN}✔${NC} $*"; }
-err(){ log error "  ${RED}✘${NC} $*"; }
 warn(){ log warn "  ${YELLOW}⚠${NC} $*"; }
+err(){ log error "  ${RED}✘${NC} $*"; }
 fatal(){
   if [ "$NO_FAIL_FAST" -eq 1 ]; then
     warn "$* (continuing due to --no-fail-fast)"
@@ -298,7 +303,7 @@ fatal(){
 
 # --- Self-integrity check --------------------------------------------------
 _SELF="$0"
-for _delim in HELPEOF PYEOF LAUNCHER_EOF JSONEOF TESTEOF CACHETESTEOF; do
+for _delim in HELPEOF PYEOF LAUNCHER_EOF GREP_LAUNCHER_EOF JSONEOF TESTEOF CACHETESTEOF; do
   if ! grep -q "^${_delim}$" "$_SELF"; then
     echo -e "${RED}✘ This installer file appears truncated (missing here-doc terminator '${_delim}').${NC}"
     echo -e "${RED}  The download was incomplete. Please re-download it fully, e.g.:${NC}"
@@ -334,11 +339,12 @@ if [ "$DRY_RUN" -eq 1 ]; then
   echo "  branch:       $BRANCH"
   echo "  timeout:      ${TIMEOUT}s   jobs: $JOBS   rust-opt: $OPT_LEVEL"
   echo "  use-tur:      $USE_TUR   wake-lock: $WAKE_LOCK"
+  echo "  suite-tools:  with-grep=$WITH_GREP   with-crawler=$WITH_CRAWLER"
   echo "  skip-upgrade: $SKIP_UPGRADE   force-reinstall: $FORCE_REINSTALL"
   echo "  no-rust:      $NO_RUST   no-cache-test: $NO_CACHE_TEST"
   echo "  no-pkg:       $NO_PKG   no-clone: $NO_CLONE   no-patch: $NO_PATCH"
   echo "  no-selftest:  $NO_SELFTEST   no-cleanup: $NO_CLEANUP"
-  echo -e "${CYAN}Would run: Phase 0 storage check → Phase 1 packages → Phase 2 clone/patch/install → Phase 3 launcher → Phase 4 self-tests → Phase 5 cleanup.${NC}"
+  echo -e "${CYAN}Would run: Phase 0 storage check → Phase 1 packages → Phase 2 clone/patch/install → Phase 3 launcher & suite config → Phase 4 self-tests → Phase 5 cleanup.${NC}"
   exit 0
 fi
 
@@ -353,9 +359,9 @@ if [ "$UNINSTALL" -eq 1 ] || [ "$PURGE" -eq 1 ]; then
   fi
   if [ "$_confirm" -eq 1 ]; then
     echo -e "${CYAN}▶ Uninstalling MCPSearch...${NC}"
-    "$PY" -m pip uninstall -y mcpsearch >/dev/null 2>&1 || true
+    "$PY" -m pip uninstall -y mcpsearch grep-mcp >/dev/null 2>&1 || true
     rm -rf "$APP_DIR"
-    rm -f "$CFG_DIR/run.sh" "$CFG_DIR/mcp_client_snippet.json"
+    rm -f "$CFG_DIR/run.sh" "$CFG_DIR/run_grep.sh" "$CFG_DIR/mcp_client_snippet.json"
     echo -e "  ${GREEN}✔${NC} removed package and source tree"
     if [ "$PURGE" -eq 1 ]; then
       rm -rf "$CFG_DIR" "$LOG_DIR" "$TMPDIR"
@@ -900,10 +906,12 @@ fi
 
 # Primary Python dependencies
 PY_DEPS="pydantic pydantic-settings httpx beautifulsoup4 lxml selectolax mcp hishel anysqlite"
+if [ "$WITH_CRAWLER" -eq 1 ]; then
+  PY_DEPS="$PY_DEPS trafilatura"
+fi
 
 install_pkg() {
   local pkg="$1"
-  # Quick check if already importable
   local mod_name="$pkg"
   case "$pkg" in
     pydantic-settings) mod_name="pydantic_settings" ;;
@@ -918,7 +926,7 @@ install_pkg() {
 
   # Tier 2: Package-specific build with appropriate compiler & link flags
   case "$pkg" in
-    lxml|selectolax)
+    lxml|selectolax|trafilatura)
       warn "$pkg: standard wheel not found, retrying with C compiler & library flags"
       CFLAGS="-I$PREFIX/include" LDFLAGS="-L$PREFIX/lib" \
       timeout $((TIMEOUT * 4)) "$PY" -m pip install --quiet --no-cache-dir --break-system-packages $TUR_INDEX_ARG --force-reinstall --no-binary :all: "$pkg" >> "$LOG_DIR/p2_pip.log" 2>&1 && return 0
@@ -983,8 +991,18 @@ else
     && ok "editable install complete" || fatal "editable install failed (see $LOG_DIR/p2_editable.log)"
 fi
 
+# ---------------------------------------------------------------- COMPANIONS
+if [ "$WITH_GREP" -eq 1 ]; then
+  step "Phase 2: Installing grep-mcp (global GitHub code search companion)"
+  if "$PY" -m pip install --quiet --no-cache-dir --break-system-packages grep-mcp >> "$LOG_DIR/p2_pip.log" 2>&1; then
+    ok "grep-mcp installed successfully"
+  else
+    warn "grep-mcp installation encountered issues (see $LOG_DIR/p2_pip.log)"
+  fi
+fi
+
 # ---------------------------------------------------------------- PHASE 3
-step "Phase 3: Generate launcher and MCP client config"
+step "Phase 3: Generate launchers and unified MCP client configuration"
 cat > "$CFG_DIR/run.sh" << LAUNCHER_EOF
 #!/data/data/com.termux/files/usr/bin/bash
 # MCPSearch stdio launcher for Termux
@@ -1000,18 +1018,57 @@ LAUNCHER_EOF
 chmod +x "$CFG_DIR/run.sh"
 ok "launcher written to $CFG_DIR/run.sh"
 
-cat > "$CFG_DIR/mcp_client_snippet.json" << JSONEOF
-{
-  "mcpServers": {
+if [ "$WITH_GREP" -eq 1 ]; then
+  cat > "$CFG_DIR/run_grep.sh" << GREP_LAUNCHER_EOF
+#!/data/data/com.termux/files/usr/bin/bash
+# grep-mcp launcher for Termux
+
+if [ "${WAKE_LOCK}" -eq 1 ] && command -v termux-wake-lock >/dev/null 2>&1; then
+  termux-wake-lock 2>/dev/null || true
+fi
+
+exec $PY -m grep_mcp
+GREP_LAUNCHER_EOF
+  chmod +x "$CFG_DIR/run_grep.sh"
+  ok "grep-mcp launcher written to $CFG_DIR/run_grep.sh"
+fi
+
+# Generate unified multi-server JSON snippet
+cat > "$TMPDIR/build_snippet.py" << 'PYEOF'
+import json, sys, os
+
+cfg_dir = sys.argv[1]
+with_grep = sys.argv[2] == "1"
+with_crawler = sys.argv[3] == "1"
+
+servers = {
     "mcpsearch": {
-      "command": "$CFG_DIR/run.sh",
-      "args": []
+        "command": os.path.join(cfg_dir, "run.sh"),
+        "args": []
     }
-  }
 }
-JSONEOF
+
+if with_grep:
+    servers["grep-code-search"] = {
+        "command": os.path.join(cfg_dir, "run_grep.sh"),
+        "args": []
+    }
+
+if with_crawler:
+    servers["trafilatura-extract"] = {
+        "command": "trafilatura",
+        "args": ["--help"]
+    }
+
+snippet = {"mcpServers": servers}
+with open(os.path.join(cfg_dir, "mcp_client_snippet.json"), "w") as f:
+    json.dump(snippet, f, indent=2)
+
+print("SUCCESS")
+PYEOF
+"$PY" "$TMPDIR/build_snippet.py" "$CFG_DIR" "$WITH_GREP" "$WITH_CRAWLER" >/dev/null 2>&1
 ok "MCP client config snippet written to $CFG_DIR/mcp_client_snippet.json"
-warn "This is a stdio MCP server: it is meant to be launched by an MCP client (e.g. Claude Desktop, Cursor), not run standalone as a network daemon. Merge the snippet above into your client's config file."
+warn "Stdio MCP servers are launched by an MCP client (e.g. Claude Desktop, Cursor, LibreChat). Merge $CFG_DIR/mcp_client_snippet.json into your client's config file."
 
 # ---------------------------------------------------------------- PHASE 4
 if [ "$NO_SELFTEST" -eq 1 ]; then
@@ -1069,6 +1126,24 @@ TESTEOF
     err "self-test FAILED — see $LOG_DIR/p4_selftest.log for the full traceback"
     echo -e "${YELLOW}The install finished but the server is not confirmed working. Review the log above.${NC}"
     exit 1
+  fi
+
+  if [ "$WITH_GREP" -eq 1 ]; then
+    step "Phase 4 companion: grep-mcp verification"
+    if "$PY" -c "import grep_mcp" >/dev/null 2>&1; then
+      ok "grep-mcp companion import verified"
+    else
+      warn "grep-mcp import test failed — check $LOG_DIR/p2_pip.log"
+    fi
+  fi
+
+  if [ "$WITH_CRAWLER" -eq 1 ]; then
+    step "Phase 4 companion: trafilatura verification"
+    if "$PY" -c "import trafilatura" >/dev/null 2>&1; then
+      ok "trafilatura companion crawler import verified"
+    else
+      warn "trafilatura import test failed — check $LOG_DIR/p2_pip.log"
+    fi
   fi
 
   if [ "$NO_CACHE_TEST" -eq 1 ]; then
@@ -1161,7 +1236,8 @@ else
   unset _FREE_KB _FREE_GB
 fi
 
-echo -e "\n${GREEN}${BOLD}All 4 phases (+cache verification +cleanup) complete.${NC}"
-echo -e "${CYAN}Launcher:${NC} $CFG_DIR/run.sh"
-echo -e "${CYAN}Client config snippet:${NC} $CFG_DIR/mcp_client_snippet.json"
-echo -e "${CYAN}Logs:${NC} $LOG_DIR"
+echo -e "\n${GREEN}${BOLD}Search & Crawl Suite installation complete.${NC}"
+echo -e "${CYAN}MCPSearch Launcher:${NC} $CFG_DIR/run.sh"
+[ "$WITH_GREP" -eq 1 ] && echo -e "${CYAN}grep-mcp Launcher:${NC}  $CFG_DIR/run_grep.sh"
+echo -e "${CYAN}Client Config:${NC}      $CFG_DIR/mcp_client_snippet.json"
+echo -e "${CYAN}Logs:${NC}               $LOG_DIR"
