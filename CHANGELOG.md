@@ -2,6 +2,22 @@
 
 All notable changes to this installer are documented here.
 
+## v1.9.2
+
+**Focus: Termux community ecosystem optimizations & background resilience**
+
+- **TUR (Termux User Repository) PyPI index integration:** Added `--extra-index-url https://termux-user-repository.github.io/pypi/` support (enabled by default, disable with `--no-tur`). Automatically pulls prebuilt Android ARM64 wheels for heavy packages like `pydantic-core`, `maturin`, and `lxml`, saving up to 10–15 minutes of mobile CPU compile time and battery.
+- **Graceful `selectolax` soft-fallback:** If `selectolax` compilation encounters C compiler or NDK header issues, the installer gracefully logs a warning and falls back to upstream's built-in `BeautifulSoup4` + `lxml` parser pipeline without aborting the installation.
+- **Background execution resilience (`termux-wake-lock`):** Automatically incorporates wake-lock acquisition in `$CFG_DIR/run.sh` when `termux-wake-lock` is available (configurable with `--no-wake-lock` or `MCPSEARCH_WAKE_LOCK=0`). Prevents Android OS power management from suspending the stdio MCP server during long multi-step research crawls.
+
+## v1.9.1
+
+**Focus: Termux linker & Rust build pipeline hardening**
+
+- **Linker warning fix (`libtermux-exec-ld-preload.so`):** In `spinner()`, child `sleep` calls now run under `env -u LD_PRELOAD`. This completely eliminates `CANNOT LINK EXECUTABLE "sleep"` linker errors when `termux-exec` is being upgraded or re-linked by `dpkg`.
+- **Hardened PyO3 / Maturin environment:** Pre-installs `maturin` and exports `RUSTFLAGS="-C opt-level=${RUST_OPT} -C link-arg=-lpython${PYVER} -L${PREFIX}/lib"`, `PYO3_PYTHON`, and `CARGO_BUILD_JOBS` upfront so any sub-dependency or downstream build has correct link paths to Termux's `libpython`.
+- **Targeted Rust tiering in `install_pkg()`:** Prevents `pydantic` and `pydantic-settings` from triggering generic unflagged `--no-binary :all:` rebuilds. Sets an extended timeout (`TIMEOUT * 6`) suitable for single-threaded mobile CPU compilation.
+
 ## v1.9.0
 
 **Focus: performance & non-interactive execution reliability**
