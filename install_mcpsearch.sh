@@ -1,6 +1,6 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # ============================================================================
-# MCPSearch Termux Installer — Master Script (v1.9.1, optimized & hardened)
+# MCPSearch Termux Installer — Master Script (v1.9.2, optimized & hardened)
 #
 # Changelog:
 #  - v1.0: Initial 4-phase installer (clone, patch, install, self-test)
@@ -33,10 +33,18 @@
 #            - Pre-install maturin and export RUSTFLAGS/PYO3_PYTHON upfront.
 #            - Fix install_pkg tiering to prevent premature unflagged --no-binary
 #              hangs on pydantic/pydantic-core and extend build timeouts for mobile CPUs.
+#  - v1.9.2: Community optimizations for Android / Termux:
+#            - TUR (Termux User Repository) PyPI index integration: enables instant
+#              prebuilt wheels for pydantic-core, lxml, and maturin, avoiding
+#              costly native compilation on battery/mobile CPUs.
+#            - Graceful selectolax soft-fallback: allows upstream BeautifulSoup4+lxml
+#              hot-path fallback if selectolax compilation fails.
+#            - Background execution resilience: optional termux-wake-lock support
+#              in generated launcher to prevent Android process suspension.
 # ============================================================================
 set -uo pipefail
 
-VERSION="1.9.1"
+VERSION="1.9.2"
 
 # Enforce non-interactive package operations to avoid background subshell hangs
 export DEBIAN_FRONTEND=noninteractive
@@ -68,6 +76,8 @@ YES=0
 NO_PROGRESS=0
 NO_FAIL_FAST=0
 LOG_LEVEL="info"
+USE_TUR="${MCPSEARCH_USE_TUR:-1}"
+WAKE_LOCK="${MCPSEARCH_WAKE_LOCK:-1}"
 
 # Tuning defaults
 TIMEOUT=60
@@ -96,10 +106,13 @@ CACHE_TEST_BACKOFF=1.0
 CACHE_TEST_INTERVAL=0.0
 NO_HTTPBIN=0
 
+# Community PyPI repository for Termux pre-compiled wheels
+TUR_PYPI_INDEX="https://termux-user-repository.github.io/pypi/"
+
 # --- CLI argument parsing --------------------------------------------------
 usage() {
   cat << 'HELPEOF'
-MCPSearch Termux Installer (v1.9.1)
+MCPSearch Termux Installer (v1.9.2)
 
 Usage:
   bash install_mcpsearch.sh [options]
@@ -122,6 +135,8 @@ Install behavior:
                        fetch+reset.
   --keep-tmp           Keep the scratch tmp dir for debugging.
   --no-rust            Skip the Rust toolchain and the Rust-link fallback tier.
+  --no-tur             Do not use TUR (Termux User Repository) prebuilt PyPI index.
+  --no-wake-lock       Do not add termux-wake-lock handling to run.sh launcher.
   --no-cache-test      Skip Phase 4b (network-dependent HTTP cache smoke test).
   --no-progress        Disable animated spinner/progress bars.
   --no-fail-fast       Downgrade 'fatal' errors to warnings and continue.
@@ -170,7 +185,7 @@ Cache test overrides (Phase 4b):
 Environment variables (lower priority than flags):
   MCPSEARCH_APP_DIR, MCPSEARCH_LOG_DIR, MCPSEARCH_CONFIG_DIR,
   MCPSEARCH_TMP_DIR, MCPSEARCH_REPO_URL, MCPSEARCH_BRANCH, MCPSEARCH_PYTHON,
-  MCPSEARCH_RUST_OPT, CARGO_BUILD_JOBS
+  MCPSEARCH_RUST_OPT, CARGO_BUILD_JOBS, MCPSEARCH_USE_TUR, MCPSEARCH_WAKE_LOCK
 HELPEOF
 }
 
@@ -186,6 +201,8 @@ while [ "$#" -gt 0 ]; do
     --force-reinstall) FORCE_REINSTALL=1; shift ;;
     --keep-tmp) KEEP_TMP=1; shift ;;
     --no-rust) NO_RUST=1; shift ;;
+    --no-tur) USE_TUR=0; shift ;;
+    --no-wake-lock) WAKE_LOCK=0; shift ;;
     --no-cache-test|--no-http-cache-test|--no-httpbin) NO_CACHE_TEST=1; shift ;;
     --no-progress) NO_PROGRESS=1; shift ;;
     --no-fail-fast) NO_FAIL_FAST=1; shift ;;
@@ -316,6 +333,7 @@ if [ "$DRY_RUN" -eq 1 ]; then
   echo "  repo-url:     $REPO_URL"
   echo "  branch:       $BRANCH"
   echo "  timeout:      ${TIMEOUT}s   jobs: $JOBS   rust-opt: $OPT_LEVEL"
+  echo "  use-tur:      $USE_TUR   wake-lock: $WAKE_LOCK"
   echo "  skip-upgrade: $SKIP_UPGRADE   force-reinstall: $FORCE_REINSTALL"
   echo "  no-rust:      $NO_RUST   no-cache-test: $NO_CACHE_TEST"
   echo "  no-pkg:       $NO_PKG   no-clone: $NO_CLONE   no-patch: $NO_PATCH"
@@ -866,11 +884,21 @@ if [ "$NO_RUST" -eq 0 ]; then
   export RUSTFLAGS="-C opt-level=${RUST_OPT} -C link-arg=-lpython${PYVER} -L${PREFIX}/lib"
   export PYO3_PYTHON="$PY"
   export CARGO_BUILD_JOBS="$JOBS"
-  # Pre-install maturin to speed up pyproject.toml Rust builds
-  "$PY" -m pip install --quiet --no-cache-dir --break-system-packages "maturin>=1.5,<2.0" >> "$LOG_DIR/p2_pip.log" 2>&1 || true
 fi
 
-# Fast-path: batch wheel install of dependencies
+# Optional TUR PyPI index flag to resolve pre-compiled Termux Android wheels
+TUR_INDEX_ARG=""
+if [ "$USE_TUR" -eq 1 ]; then
+  TUR_INDEX_ARG="--extra-index-url $TUR_PYPI_INDEX"
+  ok "TUR community PyPI index enabled ($TUR_PYPI_INDEX)"
+fi
+
+# Pre-install maturin upfront to assist in pyproject.toml / rust builds
+if [ "$NO_RUST" -eq 0 ]; then
+  "$PY" -m pip install --quiet --no-cache-dir --break-system-packages $TUR_INDEX_ARG "maturin>=1.5,<2.0" >> "$LOG_DIR/p2_pip.log" 2>&1 || true
+fi
+
+# Primary Python dependencies
 PY_DEPS="pydantic pydantic-settings httpx beautifulsoup4 lxml selectolax mcp hishel anysqlite"
 
 install_pkg() {
@@ -885,15 +913,22 @@ install_pkg() {
     return 0
   fi
 
-  # Tier 1: Standard pip install (prebuilt wheel or quick build)
-  timeout "$TIMEOUT" "$PY" -m pip install --quiet --no-cache-dir --break-system-packages "$pkg" >> "$LOG_DIR/p2_pip.log" 2>&1 && return 0
+  # Tier 1: Standard pip install (prebuilt wheel or quick build, with TUR index if enabled)
+  timeout "$TIMEOUT" "$PY" -m pip install --quiet --no-cache-dir --break-system-packages $TUR_INDEX_ARG "$pkg" >> "$LOG_DIR/p2_pip.log" 2>&1 && return 0
 
   # Tier 2: Package-specific build with appropriate compiler & link flags
   case "$pkg" in
     lxml|selectolax)
-      warn "$pkg: wheel install failed, retrying with C library flags (libxml2/libxslt)"
+      warn "$pkg: standard wheel not found, retrying with C compiler & library flags"
       CFLAGS="-I$PREFIX/include" LDFLAGS="-L$PREFIX/lib" \
-      timeout $((TIMEOUT * 4)) "$PY" -m pip install --quiet --no-cache-dir --break-system-packages --force-reinstall --no-binary :all: "$pkg" >> "$LOG_DIR/p2_pip.log" 2>&1
+      timeout $((TIMEOUT * 4)) "$PY" -m pip install --quiet --no-cache-dir --break-system-packages $TUR_INDEX_ARG --force-reinstall --no-binary :all: "$pkg" >> "$LOG_DIR/p2_pip.log" 2>&1 && return 0
+
+      # selectolax is an optional accelerator in MCPSearch; bs4+lxml is the built-in upstream fallback
+      if [ "$pkg" = "selectolax" ]; then
+        warn "selectolax native build failed; upstream will use BeautifulSoup4+lxml fallback"
+        return 0
+      fi
+      return 1
       ;;
     pydantic|pydantic-settings|pydantic-core)
       if [ "$NO_RUST" -eq 1 ]; then
@@ -903,7 +938,7 @@ install_pkg() {
       warn "$pkg: standard install failed, retrying with Rust/PyO3 flags"
       RUSTFLAGS="-C opt-level=${RUST_OPT} -C link-arg=-lpython${PYVER} -L${PREFIX}/lib" \
       PYO3_PYTHON="$PY" CARGO_BUILD_JOBS="$JOBS" \
-      timeout $((TIMEOUT * 6)) "$PY" -m pip install --quiet --no-cache-dir --break-system-packages --no-binary pydantic-core "$pkg" >> "$LOG_DIR/p2_pip.log" 2>&1 && return 0
+      timeout $((TIMEOUT * 6)) "$PY" -m pip install --quiet --no-cache-dir --break-system-packages $TUR_INDEX_ARG --no-binary pydantic-core "$pkg" >> "$LOG_DIR/p2_pip.log" 2>&1 && return 0
       # Fallback to full source build with Rust flags
       RUSTFLAGS="-C opt-level=${RUST_OPT} -C link-arg=-lpython${PYVER} -L${PREFIX}/lib" \
       PYO3_PYTHON="$PY" CARGO_BUILD_JOBS="$JOBS" \
@@ -924,8 +959,8 @@ install_pkg() {
   esac
 }
 
-# Attempt fast batch install first
-timeout $((TIMEOUT * 4)) "$PY" -m pip install --quiet --no-cache-dir --break-system-packages $PY_DEPS >> "$LOG_DIR/p2_pip.log" 2>&1 &
+# Attempt fast batch install first (leveraging TUR index if available)
+timeout $((TIMEOUT * 4)) "$PY" -m pip install --quiet --no-cache-dir --break-system-packages $TUR_INDEX_ARG $PY_DEPS >> "$LOG_DIR/p2_pip.log" 2>&1 &
 _PID=$!; spinner "$_PID" "resolving python dependencies"
 wait "$_PID" || true
 
@@ -952,6 +987,13 @@ fi
 step "Phase 3: Generate launcher and MCP client config"
 cat > "$CFG_DIR/run.sh" << LAUNCHER_EOF
 #!/data/data/com.termux/files/usr/bin/bash
+# MCPSearch stdio launcher for Termux
+
+# Acquire wake lock if requested and termux-wake-lock utility is present
+if [ "${WAKE_LOCK}" -eq 1 ] && command -v termux-wake-lock >/dev/null 2>&1; then
+  termux-wake-lock 2>/dev/null || true
+fi
+
 cd "$APP_DIR" || exit 1
 exec $PY -m mcp_server
 LAUNCHER_EOF
