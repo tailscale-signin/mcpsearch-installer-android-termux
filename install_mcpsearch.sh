@@ -1,6 +1,6 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # ============================================================================
-# MCPSearch Termux Installer — Master Script (v2.0.0: Search & Crawl Suite)
+# MCPSearch Termux Installer — Master Script (v2.1.0: Python 3.11 & Search Suite)
 #
 # Changelog:
 #  - v1.0: Initial 4-phase installer (clone, patch, install, self-test)
@@ -30,10 +30,16 @@
 #            - Unified MCP multi-server configuration generator combining
 #              mcpsearch, grep-code-search, and web-crawler in one snippet.
 #            - Self-test extensions verifying companion server readiness.
+#  - v2.1.0: Strict Python 3.11 enforcement & TUR wheel optimization:
+#            - Pinned default interpreter to Python 3.11 via TUR to bypass
+#              Rust build failures on bleeding-edge Python 3.14.
+#            - Auto-installs tur-repo and python3.11 when needed.
+#            - Uses --prefer-binary flag to prevent unnecessary source compiles.
+#            - Employs absolute interpreter paths in all generated launchers.
 # ============================================================================
 set -uo pipefail
 
-VERSION="2.0.0"
+VERSION="2.1.0"
 
 # Enforce non-interactive package operations to avoid background subshell hangs
 export DEBIAN_FRONTEND=noninteractive
@@ -46,8 +52,16 @@ CFG_DIR="${MCPSEARCH_CONFIG_DIR:-$HOME/.mcpsearch}"
 TMPDIR="${MCPSEARCH_TMP_DIR:-$HOME/.mcpsearch_tmp}"
 REPO_URL="${MCPSEARCH_REPO_URL:-https://github.com/JonusNattapong/MCPSearch}"
 BRANCH="${MCPSEARCH_BRANCH:-main}"
-PY="${MCPSEARCH_PYTHON:-python3}"
 PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
+
+# Python should always default to 3.11 for maximum pre-compiled wheel compatibility on Termux
+PY_EXPLICIT=0
+if [ -n "${MCPSEARCH_PYTHON:-}" ]; then
+  PY="$MCPSEARCH_PYTHON"
+  PY_EXPLICIT=1
+else
+  PY="python3.11"
+fi
 
 # --- Behavior defaults -----------------------------------------------------
 SKIP_UPGRADE=0
@@ -68,7 +82,7 @@ LOG_LEVEL="info"
 USE_TUR="${MCPSEARCH_USE_TUR:-1}"
 WAKE_LOCK="${MCPSEARCH_WAKE_LOCK:-1}"
 
-# Companion Search & Crawl Suite toggles (v2.0.0)
+# Companion Search & Crawl Suite toggles (v2.0.0+)
 WITH_GREP="${MCPSEARCH_WITH_GREP:-0}"
 WITH_CRAWLER="${MCPSEARCH_WITH_CRAWLER:-0}"
 
@@ -105,7 +119,7 @@ TUR_PYPI_INDEX="https://termux-user-repository.github.io/pypi/"
 # --- CLI argument parsing --------------------------------------------------
 usage() {
   cat << 'HELPEOF'
-MCPSearch Termux Installer (v2.0.0 — Search & Crawl Suite)
+MCPSearch Termux Installer (v2.1.0 — Python 3.11 & Search Suite)
 
 Usage:
   bash install_mcpsearch.sh [options]
@@ -122,7 +136,7 @@ Modes:
   --purge              Like --uninstall but also removes logs, config dir, and
                        the scratch tmp dir.
 
-Search & Crawl Suite (v2.0.0):
+Search & Crawl Suite:
   --with-grep          Install 'grep-mcp' for fast, keyless code search across
                        500k+ GitHub repositories.
   --with-crawler       Install 'trafilatura' for clean, headless web content
@@ -168,7 +182,7 @@ Paths & source:
   --config-dir DIR     Config/launcher directory (default: ~/.mcpsearch).
   --tmp-dir DIR        Scratch directory (default: ~/.mcpsearch_tmp).
   --prefix DIR         Termux prefix (default: $PREFIX).
-  --python CMD         Python interpreter (default: python3).
+  --python CMD         Python interpreter (default: python3.11).
 
 Tuning:
   --timeout SEC        Base timeout for pip/git ops (default: 60).
@@ -242,8 +256,8 @@ while [ "$#" -gt 0 ]; do
     --tmp-dir=*) TMPDIR="${1#*=}"; shift ;;
     --prefix) PREFIX="$2"; shift 2 ;;
     --prefix=*) PREFIX="${1#*=}"; shift ;;
-    --python) PY="$2"; shift 2 ;;
-    --python=*) PY="${1#*=}"; shift ;;
+    --python) PY="$2"; PY_EXPLICIT=1; shift 2 ;;
+    --python=*) PY="${1#*=}"; PY_EXPLICIT=1; shift ;;
     --timeout) TIMEOUT="$2"; shift 2 ;;
     --timeout=*) TIMEOUT="${1#*=}"; shift ;;
     --jobs) JOBS="$2"; shift 2 ;;
@@ -265,8 +279,31 @@ while [ "$#" -gt 0 ]; do
 done
 
 # --- Python interpreter & Rust tuning defaults ------------------------------
-command -v "$PY" >/dev/null 2>&1 || { command -v python3 >/dev/null 2>&1 && PY="python3" || PY="python"; }
-PYVER=$("$PY" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || echo "3.11")
+# Strictly prioritize python3.11 unless caller explicitly requested otherwise
+if [ "$PY_EXPLICIT" -eq 0 ]; then
+  if command -v python3.11 >/dev/null 2>&1; then
+    PY="python3.11"
+  elif [ -x "$PREFIX/bin/python3.11" ]; then
+    PY="$PREFIX/bin/python3.11"
+  else
+    PY="python3.11"
+  fi
+fi
+
+resolve_python_cmd() {
+  if command -v "$PY" >/dev/null 2>&1; then
+    echo "$PY"
+  elif [ -x "$PREFIX/bin/$PY" ]; then
+    echo "$PREFIX/bin/$PY"
+  elif [ "$PY_EXPLICIT" -eq 0 ] && command -v python3 >/dev/null 2>&1; then
+    echo "python3"
+  else
+    echo "$PY"
+  fi
+}
+
+PY_CMD="$(resolve_python_cmd)"
+PYVER=$("$PY_CMD" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || echo "3.11")
 
 export CARGO_BUILD_JOBS="$JOBS"
 RUST_OPT="$OPT_LEVEL"
@@ -303,7 +340,7 @@ fatal(){
 
 # --- Self-integrity check --------------------------------------------------
 _SELF="$0"
-for _delim in HELPEOF PYEOF LAUNCHER_EOF GREP_LAUNCHER_EOF JSONEOF TESTEOF CACHETESTEOF; do
+for _delim in HELPEOF PYEOF LAUNCHER_EOF GREP_LAUNCHER_EOF TESTEOF CACHETESTEOF; do
   if ! grep -q "^${_delim}$" "$_SELF"; then
     echo -e "${RED}✘ This installer file appears truncated (missing here-doc terminator '${_delim}').${NC}"
     echo -e "${RED}  The download was incomplete. Please re-download it fully, e.g.:${NC}"
@@ -344,7 +381,7 @@ if [ "$DRY_RUN" -eq 1 ]; then
   echo "  no-rust:      $NO_RUST   no-cache-test: $NO_CACHE_TEST"
   echo "  no-pkg:       $NO_PKG   no-clone: $NO_CLONE   no-patch: $NO_PATCH"
   echo "  no-selftest:  $NO_SELFTEST   no-cleanup: $NO_CLEANUP"
-  echo -e "${CYAN}Would run: Phase 0 storage check → Phase 1 packages → Phase 2 clone/patch/install → Phase 3 launcher & suite config → Phase 4 self-tests → Phase 5 cleanup.${NC}"
+  echo -e "${CYAN}Would run: Phase 0 storage check → Phase 1 packages (tur-repo, python3.11) → Phase 2 clone/patch/install → Phase 3 launcher & suite config → Phase 4 self-tests → Phase 5 cleanup.${NC}"
   exit 0
 fi
 
@@ -359,13 +396,13 @@ if [ "$UNINSTALL" -eq 1 ] || [ "$PURGE" -eq 1 ]; then
   fi
   if [ "$_confirm" -eq 1 ]; then
     echo -e "${CYAN}▶ Uninstalling MCPSearch...${NC}"
-    "$PY" -m pip uninstall -y mcpsearch grep-mcp >/dev/null 2>&1 || true
+    "$PY_CMD" -m pip uninstall -y mcpsearch grep-mcp >/dev/null 2>&1 || true
     rm -rf "$APP_DIR"
     rm -f "$CFG_DIR/run.sh" "$CFG_DIR/run_grep.sh" "$CFG_DIR/mcp_client_snippet.json"
     echo -e "  ${GREEN}✔${NC} removed package and source tree"
     if [ "$PURGE" -eq 1 ]; then
       rm -rf "$CFG_DIR" "$LOG_DIR" "$TMPDIR"
-      "$PY" -m pip cache purge >/dev/null 2>&1 || true
+      "$PY_CMD" -m pip cache purge >/dev/null 2>&1 || true
       echo -e "  ${GREEN}✔${NC} purged config, logs, tmp, and pip cache"
     fi
   fi
@@ -374,13 +411,121 @@ fi
 
 echo -e "${BOLD}${CYAN}== MCPSearch Termux Installer — Phases 1-5 (v$VERSION) ==${NC}"
 
-# --- Check-only mode: run Phase 4 against existing install and exit -------
+# ---------------------------------------------------------------- PHASE 0
+step "Phase 0: Storage pre-flight check"
+_FREE_KB=$(df -P "$HOME" 2>/dev/null | awk 'NR==2 {print $4}')
+if [ -n "$_FREE_KB" ] && [ "$_FREE_KB" -gt 0 ] 2>/dev/null; then
+  _FREE_GB=$((_FREE_KB / 1024 / 1024))
+  if [ "$_FREE_GB" -lt 2 ]; then
+    warn "Only ~${_FREE_GB}GB free on $HOME. Native builds can need 2-4GB. Free space or run 'termux-setup-storage' before continuing."
+  else
+    ok "~${_FREE_GB}GB free on $HOME"
+  fi
+else
+  warn "could not determine free space on $HOME"
+fi
+unset _FREE_KB _FREE_GB
+
+# ---------------------------------------------------------------- PHASE 1
+if [ "$NO_PKG" -eq 1 ]; then
+  step "Phase 1: Termux packages (skipped via --no-pkg)"
+else
+  step "Phase 1: Termux packages (ensuring TUR & Python 3.11)"
+  
+  # Ensure dpkg status is cleanly configured before running
+  dpkg --configure -a >> "$LOG_DIR/p1.log" 2>&1 || true
+
+  if [ "$NO_UPDATE" -eq 1 ]; then
+    warn "skipping 'pkg update' (--no-update)"
+  else
+    apt-get update $APT_DPKG_FLAGS > "$LOG_DIR/p1.log" 2>&1 &
+    _PID=$!; spinner "$_PID" "apt-get update"
+    if wait "$_PID"; then ok "apt-get update"; else warn "apt-get update had issues"; fi
+  fi
+
+  if [ "$SKIP_UPGRADE" -eq 1 ]; then
+    warn "skipping 'pkg upgrade' (--skip-upgrade)"
+  else
+    apt-get upgrade $APT_DPKG_FLAGS >> "$LOG_DIR/p1.log" 2>&1 &
+    _PID=$!; spinner "$_PID" "apt-get upgrade (this can take a while)"
+    if wait "$_PID"; then ok "apt-get upgrade"; else warn "apt-get upgrade had issues"; fi
+  fi
+
+  # Attempt fixing broken dependencies if any were left in a partial state
+  apt-get --fix-broken install $APT_DPKG_FLAGS >> "$LOG_DIR/p1.log" 2>&1 || true
+
+  # Ensure tur-repo is available so python3.11 package can be resolved
+  if ! dpkg -s "tur-repo" >/dev/null 2>&1; then
+    apt-get install $APT_DPKG_FLAGS tur-repo >> "$LOG_DIR/p1.log" 2>&1 || pkg install -y tur-repo >> "$LOG_DIR/p1.log" 2>&1 || true
+    apt-get update $APT_DPKG_FLAGS >> "$LOG_DIR/p1.log" 2>&1 || true
+  fi
+
+  # Toolchain and core dependencies; explicitly targeting python3.11
+  if [ "$NO_RUST" -eq 1 ]; then
+    warn "Rust toolchain skipped (--no-rust). Rust-based packages will only install if a prebuilt wheel exists."
+    REQ_PKGS="tur-repo python3.11 git binutils libjpeg-turbo libxml2 libxslt clang make pkg-config openssl patchelf curl"
+  else
+    REQ_PKGS="tur-repo python3.11 git rust binutils libjpeg-turbo libxml2 libxslt clang make pkg-config openssl patchelf curl"
+  fi
+
+  # Optimized Batch Detection: Only install packages that are not yet installed
+  MISSING_PKGS=""
+  for p in $REQ_PKGS; do
+    if ! dpkg -s "$p" >/dev/null 2>&1; then
+      MISSING_PKGS="$MISSING_PKGS $p"
+    fi
+  done
+
+  if [ -z "$MISSING_PKGS" ]; then
+    ok "all required packages already installed"
+  else
+    apt-get install $APT_DPKG_FLAGS $MISSING_PKGS >> "$LOG_DIR/p1.log" 2>&1 &
+    _PID=$!; spinner "$_PID" "installing missing packages: $MISSING_PKGS"
+    if wait "$_PID"; then
+      ok "installed packages:$MISSING_PKGS"
+    else
+      warn "batch install had issues, retrying individual essential packages"
+      for p in $REQ_PKGS; do
+        if ! dpkg -s "$p" >/dev/null 2>&1; then
+          apt-get install $APT_DPKG_FLAGS "$p" >> "$LOG_DIR/p1.log" 2>&1 || warn "optional package $p could not be installed directly"
+        fi
+      done
+    fi
+  fi
+
+  # Re-evaluate interpreter after package install to bind directly to python3.11
+  if [ "$PY_EXPLICIT" -eq 0 ]; then
+    if command -v python3.11 >/dev/null 2>&1; then
+      PY="python3.11"
+    elif [ -x "$PREFIX/bin/python3.11" ]; then
+      PY="$PREFIX/bin/python3.11"
+    fi
+  fi
+  PY_CMD="$(resolve_python_cmd)"
+  PYVER=$("$PY_CMD" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || echo "3.11")
+
+  if [ "$NO_ENSUREPIP" -eq 1 ]; then
+    warn "skipping 'python -m ensurepip' (--no-ensurepip)"
+  else
+    "$PY_CMD" -m ensurepip --upgrade > "$LOG_DIR/p1_pip.log" 2>&1 || true
+  fi
+  if [ "$NO_PIP_UPGRADE" -eq 1 ]; then
+    warn "skipping pip upgrade (--no-pip-upgrade)"
+  else
+    "$PY_CMD" -m pip install --upgrade pip --break-system-packages >> "$LOG_DIR/p1_pip.log" 2>&1 || warn "pip upgrade had issues"
+  fi
+  ok "interpreter ready: $("$PY_CMD" --version 2>&1) ($PY_CMD)"
+fi
+
+# Ensure PY_CMD is refreshed
+PY_CMD="$(resolve_python_cmd)"
+
+# ---------------------------------------------------------------- CHECK-ONLY
 if [ "$CHECK_ONLY" -eq 1 ]; then
   step "Check mode: running Phase 4 self-tests against existing install at $APP_DIR"
   [ -d "$APP_DIR" ] || fatal "no existing install found at $APP_DIR"
   [ -f "$APP_DIR/mcp_server/server.py" ] || fatal "mcp_server/server.py missing in $APP_DIR"
 
-  # Phase 4 self-test
   cat > "$TMPDIR/mcpsearch_selftest.py" << 'TESTEOF'
 import sys, os, asyncio, traceback
 
@@ -426,7 +571,7 @@ except Exception as e:
 print("SELFTEST_PASS")
 TESTEOF
   sed -i "s|__APP_DIR__|${APP_DIR}|g" "$TMPDIR/mcpsearch_selftest.py"
-  if "$PY" "$TMPDIR/mcpsearch_selftest.py" 2>&1 | tee "$LOG_DIR/p4_selftest.log" | grep -q "SELFTEST_PASS"; then
+  if "$PY_CMD" "$TMPDIR/mcpsearch_selftest.py" 2>&1 | tee "$LOG_DIR/p4_selftest.log" | grep -q "SELFTEST_PASS"; then
     ok "self-test passed — server imports and responds to a tool call cleanly"
   else
     err "self-test FAILED — see $LOG_DIR/p4_selftest.log for the full traceback"
@@ -489,7 +634,7 @@ asyncio.run(main())
 CACHETESTEOF
     sed -i "s|__APP_DIR__|${APP_DIR}|g" "$TMPDIR/mcpsearch_cache_selftest.py"
     sed -i "s|__CACHE_TEST_URL__|${CACHE_TEST_URL}|g" "$TMPDIR/mcpsearch_cache_selftest.py"
-    if "$PY" "$TMPDIR/mcpsearch_cache_selftest.py" 2>&1 | tee "$LOG_DIR/p4b_cache_selftest.log" | grep -q "CACHETEST_PASS"; then
+    if "$PY_CMD" "$TMPDIR/mcpsearch_cache_selftest.py" 2>&1 | tee "$LOG_DIR/p4b_cache_selftest.log" | grep -q "CACHETEST_PASS"; then
       ok "HTTP cache self-test passed — hishel/anysqlite wired correctly, no deprecation warnings"
     else
       err "HTTP cache self-test FAILED — see $LOG_DIR/p4b_cache_selftest.log for the full traceback"
@@ -498,97 +643,6 @@ CACHETESTEOF
   fi
   ok "Check complete. Install at $APP_DIR verified."
   exit 0
-fi
-
-# ---------------------------------------------------------------- PHASE 0
-step "Phase 0: Storage pre-flight check"
-_FREE_KB=$(df -P "$HOME" 2>/dev/null | awk 'NR==2 {print $4}')
-if [ -n "$_FREE_KB" ] && [ "$_FREE_KB" -gt 0 ] 2>/dev/null; then
-  _FREE_GB=$((_FREE_KB / 1024 / 1024))
-  if [ "$_FREE_GB" -lt 2 ]; then
-    warn "Only ~${_FREE_GB}GB free on $HOME. Native builds (pydantic-core, lxml) can need 2-4GB. Free space or run 'termux-setup-storage' before continuing."
-  else
-    ok "~${_FREE_GB}GB free on $HOME"
-  fi
-else
-  warn "could not determine free space on $HOME"
-fi
-unset _FREE_KB _FREE_GB
-
-# ---------------------------------------------------------------- PHASE 1
-if [ "$NO_PKG" -eq 1 ]; then
-  step "Phase 1: Termux packages (skipped via --no-pkg)"
-else
-  step "Phase 1: Termux packages"
-  
-  # Ensure dpkg status is cleanly configured before running
-  dpkg --configure -a >> "$LOG_DIR/p1.log" 2>&1 || true
-
-  if [ "$NO_UPDATE" -eq 1 ]; then
-    warn "skipping 'pkg update' (--no-update)"
-  else
-    apt-get update $APT_DPKG_FLAGS > "$LOG_DIR/p1.log" 2>&1 &
-    _PID=$!; spinner "$_PID" "apt-get update"
-    if wait "$_PID"; then ok "apt-get update"; else warn "apt-get update had issues"; fi
-  fi
-
-  if [ "$SKIP_UPGRADE" -eq 1 ]; then
-    warn "skipping 'pkg upgrade' (--skip-upgrade)"
-  else
-    apt-get upgrade $APT_DPKG_FLAGS >> "$LOG_DIR/p1.log" 2>&1 &
-    _PID=$!; spinner "$_PID" "apt-get upgrade (this can take a while)"
-    if wait "$_PID"; then ok "apt-get upgrade"; else warn "apt-get upgrade had issues"; fi
-  fi
-
-  # Attempt fixing broken dependencies if any were left in a partial state
-  apt-get --fix-broken install $APT_DPKG_FLAGS >> "$LOG_DIR/p1.log" 2>&1 || true
-
-  # Pre-packaged native python-lxml & python-maturin save significant compile time from source
-  if [ "$NO_RUST" -eq 1 ]; then
-    warn "Rust toolchain skipped (--no-rust). Rust-based packages (pydantic-core) will only install if a prebuilt wheel exists."
-    REQ_PKGS="python python-lxml python-maturin git binutils libjpeg-turbo libxml2 libxslt clang make pkg-config openssl patchelf curl"
-  else
-    REQ_PKGS="python python-lxml python-maturin git rust binutils libjpeg-turbo libxml2 libxslt clang make pkg-config openssl patchelf curl"
-  fi
-
-  # Optimized Batch Detection: Only install packages that are not yet installed
-  MISSING_PKGS=""
-  for p in $REQ_PKGS; do
-    if ! dpkg -s "$p" >/dev/null 2>&1; then
-      MISSING_PKGS="$MISSING_PKGS $p"
-    fi
-  done
-
-  if [ -z "$MISSING_PKGS" ]; then
-    ok "all required packages already installed"
-  else
-    # Install all missing packages in a single batch call to save multiple dpkg database locks
-    apt-get install $APT_DPKG_FLAGS $MISSING_PKGS >> "$LOG_DIR/p1.log" 2>&1 &
-    _PID=$!; spinner "$_PID" "installing missing packages: $MISSING_PKGS"
-    if wait "$_PID"; then
-      ok "installed packages:$MISSING_PKGS"
-    else
-      # If optional packages fail, fall back to individual package installs
-      warn "batch install had issues, retrying individual essential packages"
-      for p in $REQ_PKGS; do
-        if ! dpkg -s "$p" >/dev/null 2>&1; then
-          apt-get install $APT_DPKG_FLAGS "$p" >> "$LOG_DIR/p1.log" 2>&1 || warn "optional package $p could not be installed directly"
-        fi
-      done
-    fi
-  fi
-
-  if [ "$NO_ENSUREPIP" -eq 1 ]; then
-    warn "skipping 'python -m ensurepip' (--no-ensurepip)"
-  else
-    "$PY" -m ensurepip --upgrade > "$LOG_DIR/p1_pip.log" 2>&1 || true
-  fi
-  if [ "$NO_PIP_UPGRADE" -eq 1 ]; then
-    warn "skipping pip upgrade (--no-pip-upgrade)"
-  else
-    "$PY" -m pip install --upgrade pip --break-system-packages >> "$LOG_DIR/p1_pip.log" 2>&1 || warn "pip upgrade had issues"
-  fi
-  ok "interpreter ready: $("$PY" --version 2>&1)"
 fi
 
 # ---------------------------------------------------------------- PHASE 2
@@ -837,7 +891,7 @@ if "get_research_agent_instance" in src:
 print("VERIFY_OK: patch script completed without fatal issues")
 PYEOF
   sed -i "s|__APP_DIR__|${APP_DIR}|g" "$TMPDIR/mcpsearch_patch.py"
-  "$PY" "$TMPDIR/mcpsearch_patch.py" 2>&1 | tee "$LOG_DIR/p2_patch.log"
+  "$PY_CMD" "$TMPDIR/mcpsearch_patch.py" 2>&1 | tee "$LOG_DIR/p2_patch.log"
   if [ "$NO_VERIFY" -eq 1 ]; then
     ok "server.py patch script completed (verification skipped)"
   else
@@ -872,23 +926,23 @@ else:
 print("VERIFY_OK: http_client.py patch script completed")
 PYEOF
   sed -i "s|__APP_DIR__|${APP_DIR}|g" "$TMPDIR/mcpsearch_patch_httpclient.py"
-  "$PY" "$TMPDIR/mcpsearch_patch_httpclient.py" 2>&1 | tee "$LOG_DIR/p2_patch_httpclient.log"
+  "$PY_CMD" "$TMPDIR/mcpsearch_patch_httpclient.py" 2>&1 | tee "$LOG_DIR/p2_patch_httpclient.log"
   if [ "$NO_VERIFY" -eq 1 ]; then
     ok "http_client.py patch script completed (verification skipped)"
   else
     grep -q "VERIFY_OK" "$LOG_DIR/p2_patch_httpclient.log" || fatal "http_client.py patch verification failed, see $LOG_DIR/p2_patch_httpclient.log"
   fi
-  "$PY" -m py_compile "$APP_DIR/utils/http_client.py" 2>>"$LOG_DIR/p2_patch_httpclient.log" \
+  "$PY_CMD" -m py_compile "$APP_DIR/utils/http_client.py" 2>>"$LOG_DIR/p2_patch_httpclient.log" \
     && ok "http_client.py patched and compiles cleanly" \
     || fatal "http_client.py failed to compile after patch, see $LOG_DIR/p2_patch_httpclient.log"
 fi
 
-step "Phase 2: Install Python dependencies (optimized batch + fallback tiers)"
+step "Phase 2: Install Python dependencies (TUR prebuilt wheels + multi-tier fallback)"
 
 # Set build flags for native/Rust packages upfront so all pip invocations inherit them
 if [ "$NO_RUST" -eq 0 ]; then
   export RUSTFLAGS="-C opt-level=${RUST_OPT} -C link-arg=-lpython${PYVER} -L${PREFIX}/lib"
-  export PYO3_PYTHON="$PY"
+  export PYO3_PYTHON="$PY_CMD"
   export CARGO_BUILD_JOBS="$JOBS"
 fi
 
@@ -899,9 +953,14 @@ if [ "$USE_TUR" -eq 1 ]; then
   ok "TUR community PyPI index enabled ($TUR_PYPI_INDEX)"
 fi
 
-# Pre-install maturin upfront to assist in pyproject.toml / rust builds
+# Pre-install maturin upfront if Rust is enabled
 if [ "$NO_RUST" -eq 0 ]; then
-  "$PY" -m pip install --quiet --no-cache-dir --break-system-packages $TUR_INDEX_ARG "maturin>=1.5,<2.0" >> "$LOG_DIR/p2_pip.log" 2>&1 || true
+  "$PY_CMD" -m pip install --quiet --no-cache-dir --break-system-packages --prefer-binary $TUR_INDEX_ARG "maturin>=1.5,<2.0" >> "$LOG_DIR/p2_pip.log" 2>&1 || true
+fi
+
+# Pre-install pydantic-core from TUR prebuilt wheels to prevent Rust compilation hangs
+if [ "$USE_TUR" -eq 1 ]; then
+  "$PY_CMD" -m pip install --quiet --no-cache-dir --break-system-packages --prefer-binary $TUR_INDEX_ARG "pydantic-core" >> "$LOG_DIR/p2_pip.log" 2>&1 || true
 fi
 
 # Primary Python dependencies
@@ -917,19 +976,19 @@ install_pkg() {
     pydantic-settings) mod_name="pydantic_settings" ;;
     beautifulsoup4) mod_name="bs4" ;;
   esac
-  if "$PY" -c "import $mod_name" >/dev/null 2>&1; then
+  if "$PY_CMD" -c "import $mod_name" >/dev/null 2>&1; then
     return 0
   fi
 
   # Tier 1: Standard pip install (prebuilt wheel or quick build, with TUR index if enabled)
-  timeout "$TIMEOUT" "$PY" -m pip install --quiet --no-cache-dir --break-system-packages $TUR_INDEX_ARG "$pkg" >> "$LOG_DIR/p2_pip.log" 2>&1 && return 0
+  timeout "$TIMEOUT" "$PY_CMD" -m pip install --quiet --no-cache-dir --break-system-packages --prefer-binary $TUR_INDEX_ARG "$pkg" >> "$LOG_DIR/p2_pip.log" 2>&1 && return 0
 
   # Tier 2: Package-specific build with appropriate compiler & link flags
   case "$pkg" in
     lxml|selectolax|trafilatura)
       warn "$pkg: standard wheel not found, retrying with C compiler & library flags"
       CFLAGS="-I$PREFIX/include" LDFLAGS="-L$PREFIX/lib" \
-      timeout $((TIMEOUT * 4)) "$PY" -m pip install --quiet --no-cache-dir --break-system-packages $TUR_INDEX_ARG --force-reinstall --no-binary :all: "$pkg" >> "$LOG_DIR/p2_pip.log" 2>&1 && return 0
+      timeout $((TIMEOUT * 4)) "$PY_CMD" -m pip install --quiet --no-cache-dir --break-system-packages $TUR_INDEX_ARG --force-reinstall --no-binary :all: "$pkg" >> "$LOG_DIR/p2_pip.log" 2>&1 && return 0
 
       # selectolax is an optional accelerator in MCPSearch; bs4+lxml is the built-in upstream fallback
       if [ "$pkg" = "selectolax" ]; then
@@ -943,23 +1002,23 @@ install_pkg() {
         err "$pkg: requires Rust toolchain for pydantic-core but --no-rust is set"
         return 1
       fi
-      warn "$pkg: standard install failed, retrying with Rust/PyO3 flags"
+      warn "$pkg: standard install failed, retrying with Rust/PyO3 flags and TUR wheel index"
       RUSTFLAGS="-C opt-level=${RUST_OPT} -C link-arg=-lpython${PYVER} -L${PREFIX}/lib" \
-      PYO3_PYTHON="$PY" CARGO_BUILD_JOBS="$JOBS" \
-      timeout $((TIMEOUT * 6)) "$PY" -m pip install --quiet --no-cache-dir --break-system-packages $TUR_INDEX_ARG --no-binary pydantic-core "$pkg" >> "$LOG_DIR/p2_pip.log" 2>&1 && return 0
-      # Fallback to full source build with Rust flags
+      PYO3_PYTHON="$PY_CMD" CARGO_BUILD_JOBS="$JOBS" \
+      timeout $((TIMEOUT * 6)) "$PY_CMD" -m pip install --quiet --no-cache-dir --break-system-packages --prefer-binary $TUR_INDEX_ARG "$pkg" >> "$LOG_DIR/p2_pip.log" 2>&1 && return 0
+      # Fallback to source build with Rust flags
       RUSTFLAGS="-C opt-level=${RUST_OPT} -C link-arg=-lpython${PYVER} -L${PREFIX}/lib" \
-      PYO3_PYTHON="$PY" CARGO_BUILD_JOBS="$JOBS" \
-      timeout $((TIMEOUT * 6)) "$PY" -m pip install --quiet --no-cache-dir --break-system-packages --force-reinstall --no-binary :all: "$pkg" >> "$LOG_DIR/p2_pip.log" 2>&1
+      PYO3_PYTHON="$PY_CMD" CARGO_BUILD_JOBS="$JOBS" \
+      timeout $((TIMEOUT * 6)) "$PY_CMD" -m pip install --quiet --no-cache-dir --break-system-packages --force-reinstall --no-binary :all: "$pkg" >> "$LOG_DIR/p2_pip.log" 2>&1
       ;;
     *)
-      warn "$pkg: wheel install failed, retrying --no-binary :all:"
-      timeout $((TIMEOUT * 3)) "$PY" -m pip install --quiet --no-cache-dir --break-system-packages --no-binary :all: "$pkg" >> "$LOG_DIR/p2_pip.log" 2>&1 && return 0
+      warn "$pkg: wheel install failed, retrying --prefer-binary"
+      timeout $((TIMEOUT * 3)) "$PY_CMD" -m pip install --quiet --no-cache-dir --break-system-packages --prefer-binary "$pkg" >> "$LOG_DIR/p2_pip.log" 2>&1 && return 0
       if [ "$NO_RUST" -eq 0 ]; then
         warn "$pkg: retrying with Rust link flags (python${PYVER})"
         RUSTFLAGS="-C opt-level=${RUST_OPT} -C link-arg=-lpython${PYVER} -L${PREFIX}/lib" \
-        PYO3_PYTHON="$PY" CARGO_BUILD_JOBS="$JOBS" \
-        timeout $((TIMEOUT * 6)) "$PY" -m pip install --quiet --no-cache-dir --break-system-packages --force-reinstall "$pkg" >> "$LOG_DIR/p2_pip.log" 2>&1
+        PYO3_PYTHON="$PY_CMD" CARGO_BUILD_JOBS="$JOBS" \
+        timeout $((TIMEOUT * 6)) "$PY_CMD" -m pip install --quiet --no-cache-dir --break-system-packages --force-reinstall "$pkg" >> "$LOG_DIR/p2_pip.log" 2>&1
       else
         return 1
       fi
@@ -968,7 +1027,7 @@ install_pkg() {
 }
 
 # Attempt fast batch install first (leveraging TUR index if available)
-timeout $((TIMEOUT * 4)) "$PY" -m pip install --quiet --no-cache-dir --break-system-packages $TUR_INDEX_ARG $PY_DEPS >> "$LOG_DIR/p2_pip.log" 2>&1 &
+timeout $((TIMEOUT * 4)) "$PY_CMD" -m pip install --quiet --no-cache-dir --break-system-packages --prefer-binary $TUR_INDEX_ARG $PY_DEPS >> "$LOG_DIR/p2_pip.log" 2>&1 &
 _PID=$!; spinner "$_PID" "resolving python dependencies"
 wait "$_PID" || true
 
@@ -987,14 +1046,14 @@ if [ "$NO_EDITABLE" -eq 1 ]; then
   warn "skipping editable install (--no-editable)"
 else
   step "Phase 2: Editable install of MCPSearch"
-  timeout 120 "$PY" -m pip install --quiet --no-cache-dir --break-system-packages -e "$APP_DIR" > "$LOG_DIR/p2_editable.log" 2>&1 \
+  timeout 120 "$PY_CMD" -m pip install --quiet --no-cache-dir --break-system-packages -e "$APP_DIR" > "$LOG_DIR/p2_editable.log" 2>&1 \
     && ok "editable install complete" || fatal "editable install failed (see $LOG_DIR/p2_editable.log)"
 fi
 
 # ---------------------------------------------------------------- COMPANIONS
 if [ "$WITH_GREP" -eq 1 ]; then
   step "Phase 2: Installing grep-mcp (global GitHub code search companion)"
-  if "$PY" -m pip install --quiet --no-cache-dir --break-system-packages grep-mcp >> "$LOG_DIR/p2_pip.log" 2>&1; then
+  if "$PY_CMD" -m pip install --quiet --no-cache-dir --break-system-packages grep-mcp >> "$LOG_DIR/p2_pip.log" 2>&1; then
     ok "grep-mcp installed successfully"
   else
     warn "grep-mcp installation encountered issues (see $LOG_DIR/p2_pip.log)"
@@ -1003,6 +1062,8 @@ fi
 
 # ---------------------------------------------------------------- PHASE 3
 step "Phase 3: Generate launchers and unified MCP client configuration"
+PY_BIN="$(command -v "$PY_CMD" 2>/dev/null || echo "$PY_CMD")"
+
 cat > "$CFG_DIR/run.sh" << LAUNCHER_EOF
 #!/data/data/com.termux/files/usr/bin/bash
 # MCPSearch stdio launcher for Termux
@@ -1013,7 +1074,7 @@ if [ "${WAKE_LOCK}" -eq 1 ] && command -v termux-wake-lock >/dev/null 2>&1; then
 fi
 
 cd "$APP_DIR" || exit 1
-exec $PY -m mcp_server
+exec $PY_BIN -m mcp_server
 LAUNCHER_EOF
 chmod +x "$CFG_DIR/run.sh"
 ok "launcher written to $CFG_DIR/run.sh"
@@ -1027,7 +1088,7 @@ if [ "${WAKE_LOCK}" -eq 1 ] && command -v termux-wake-lock >/dev/null 2>&1; then
   termux-wake-lock 2>/dev/null || true
 fi
 
-exec $PY -m grep_mcp
+exec $PY_BIN -m grep_mcp
 GREP_LAUNCHER_EOF
   chmod +x "$CFG_DIR/run_grep.sh"
   ok "grep-mcp launcher written to $CFG_DIR/run_grep.sh"
@@ -1066,7 +1127,7 @@ with open(os.path.join(cfg_dir, "mcp_client_snippet.json"), "w") as f:
 
 print("SUCCESS")
 PYEOF
-"$PY" "$TMPDIR/build_snippet.py" "$CFG_DIR" "$WITH_GREP" "$WITH_CRAWLER" >/dev/null 2>&1
+"$PY_CMD" "$TMPDIR/build_snippet.py" "$CFG_DIR" "$WITH_GREP" "$WITH_CRAWLER" >/dev/null 2>&1
 ok "MCP client config snippet written to $CFG_DIR/mcp_client_snippet.json"
 warn "Stdio MCP servers are launched by an MCP client (e.g. Claude Desktop, Cursor, LibreChat). Merge $CFG_DIR/mcp_client_snippet.json into your client's config file."
 
@@ -1120,7 +1181,7 @@ except Exception as e:
 print("SELFTEST_PASS")
 TESTEOF
   sed -i "s|__APP_DIR__|${APP_DIR}|g" "$TMPDIR/mcpsearch_selftest.py"
-  if "$PY" "$TMPDIR/mcpsearch_selftest.py" 2>&1 | tee "$LOG_DIR/p4_selftest.log" | grep -q "SELFTEST_PASS"; then
+  if "$PY_CMD" "$TMPDIR/mcpsearch_selftest.py" 2>&1 | tee "$LOG_DIR/p4_selftest.log" | grep -q "SELFTEST_PASS"; then
     ok "self-test passed — server imports and responds to a tool call cleanly"
   else
     err "self-test FAILED — see $LOG_DIR/p4_selftest.log for the full traceback"
@@ -1130,7 +1191,7 @@ TESTEOF
 
   if [ "$WITH_GREP" -eq 1 ]; then
     step "Phase 4 companion: grep-mcp verification"
-    if "$PY" -c "import grep_mcp" >/dev/null 2>&1; then
+    if "$PY_CMD" -c "import grep_mcp" >/dev/null 2>&1; then
       ok "grep-mcp companion import verified"
     else
       warn "grep-mcp import test failed — check $LOG_DIR/p2_pip.log"
@@ -1139,7 +1200,7 @@ TESTEOF
 
   if [ "$WITH_CRAWLER" -eq 1 ]; then
     step "Phase 4 companion: trafilatura verification"
-    if "$PY" -c "import trafilatura" >/dev/null 2>&1; then
+    if "$PY_CMD" -c "import trafilatura" >/dev/null 2>&1; then
       ok "trafilatura companion crawler import verified"
     else
       warn "trafilatura import test failed — check $LOG_DIR/p2_pip.log"
@@ -1200,10 +1261,9 @@ async def main():
 
 asyncio.run(main())
 CACHETESTEOF
-    # Substitute dynamic app-dir and cache-test URL into the generated test.
     sed -i "s|__APP_DIR__|${APP_DIR}|g" "$TMPDIR/mcpsearch_cache_selftest.py"
     sed -i "s|__CACHE_TEST_URL__|${CACHE_TEST_URL}|g" "$TMPDIR/mcpsearch_cache_selftest.py"
-    if "$PY" "$TMPDIR/mcpsearch_cache_selftest.py" 2>&1 | tee "$LOG_DIR/p4b_cache_selftest.log" | grep -q "CACHETEST_PASS"; then
+    if "$PY_CMD" "$TMPDIR/mcpsearch_cache_selftest.py" 2>&1 | tee "$LOG_DIR/p4b_cache_selftest.log" | grep -q "CACHETEST_PASS"; then
       ok "HTTP cache self-test passed — hishel/anysqlite wired correctly, no deprecation warnings"
     else
       err "HTTP cache self-test FAILED — see $LOG_DIR/p4b_cache_selftest.log for the full traceback"
@@ -1218,7 +1278,7 @@ if [ "$NO_CLEANUP" -eq 1 ]; then
   warn "skipping Phase 5 cleanup (--no-cleanup)"
 else
   step "Phase 5: Post-install cleanup (reclaim build space)"
-  "$PY" -m pip cache purge > "$LOG_DIR/p5_cleanup.log" 2>&1 || true
+  "$PY_CMD" -m pip cache purge > "$LOG_DIR/p5_cleanup.log" 2>&1 || true
   rm -rf "$HOME/.cache/pip" 2>/dev/null
   if [ "$KEEP_TMP" -eq 1 ]; then
     warn "keeping scratch tmp dir (--keep-tmp): $TMPDIR"
