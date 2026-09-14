@@ -1,6 +1,6 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # ============================================================================
-# MCPSearch Termux Installer — Master Script (v2.1.1: Python 3.11 & Search Suite)
+# MCPSearch Termux Installer — Master Script (v2.1.2: Python 3.11 & Search Suite)
 #
 # Changelog:
 #  - v1.0: Initial 4-phase installer (clone, patch, install, self-test)
@@ -36,10 +36,17 @@
 #            - Termux's pip requires --extra-index-url and direct wheel URL
 #              fallback if pip tag check flags bionic libc mismatch.
 #            - Auto-fetches and installs direct TUR wheels for pydantic-core.
+#  - v2.1.2: TUR GitHub Releases direct download & pydantic dependency pinning:
+#            - Fixes 404 URL by fetching prebuilt pydantic-core v2.35.2 wheel
+#              directly from tur-pypi-dists GitHub releases.
+#            - Ensures typing-extensions>=4.12.2 and pins pydantic<2.12 to prevent
+#              unnecessary Rust builds on Android.
+#            - Applies --no-deps to editable MCPSearch install to preserve
+#              prebuilt wheel stack.
 # ============================================================================
 set -uo pipefail
 
-VERSION="2.1.1"
+VERSION="2.1.2"
 
 # Enforce non-interactive package operations to avoid background subshell hangs
 export DEBIAN_FRONTEND=noninteractive
@@ -119,7 +126,7 @@ TUR_PYPI_INDEX="https://termux-user-repository.github.io/pypi/"
 # --- CLI argument parsing --------------------------------------------------
 usage() {
   cat << 'HELPEOF'
-MCPSearch Termux Installer (v2.1.1 — Python 3.11 & Search Suite)
+MCPSearch Termux Installer (v2.1.2 — Python 3.11 & Search Suite)
 
 Usage:
   bash install_mcpsearch.sh [options]
@@ -967,20 +974,35 @@ if [ "$NO_RUST" -eq 0 ]; then
   "$PY_CMD" -m pip install --quiet --no-cache-dir --break-system-packages --prefer-binary $TUR_INDEX_ARG "maturin>=1.5,<2.0" >> "$LOG_DIR/p2_pip.log" 2>&1 || true
 fi
 
-# Direct installation of pydantic-core wheel from TUR repository if available
+# Direct installation of pydantic-core wheel from TUR GitHub releases if available
 if [ "$USE_TUR" -eq 1 ] && ! "$PY_CMD" -c "import pydantic_core" >/dev/null 2>&1; then
-  TUR_CORE_URL="https://termux-user-repository.github.io/pypi/pydantic-core/pydantic_core-2.27.2-cp311-cp311-${TUR_ARCH}.whl"
-  # Download directly into tmp and attempt install (handling pip wheel tag compatibility)
-  if curl -fsSL "$TUR_CORE_URL" -o "$TMPDIR/pydantic_core_tur.whl" 2>/dev/null; then
+  # Ensure typing-extensions is present
+  "$PY_CMD" -m pip install --quiet --no-cache-dir --break-system-packages "typing-extensions>=4.12.2" >> "$LOG_DIR/p2_pip.log" 2>&1 || true
+
+  # Fetch prebuilt pydantic-core wheel from TUR releases (v2.35.2 or fallback to v2.27.2)
+  TUR_CORE_VER="2.35.2"
+  TUR_CORE_URL="https://github.com/tur-pypi-dists/python3.11-pydantic_core/releases/download/v${TUR_CORE_VER}/pydantic_core-${TUR_CORE_VER}-cp311-cp311-${TUR_ARCH}.whl"
+  if ! curl -fsSL "$TUR_CORE_URL" -o "$TMPDIR/pydantic_core_tur.whl" 2>/dev/null; then
+    TUR_CORE_VER="2.27.2"
+    TUR_CORE_URL="https://github.com/tur-pypi-dists/python3.11-pydantic_core/releases/download/v${TUR_CORE_VER}/pydantic_core-${TUR_CORE_VER}-cp311-cp311-${TUR_ARCH}.whl"
+    curl -fsSL "$TUR_CORE_URL" -o "$TMPDIR/pydantic_core_tur.whl" 2>/dev/null || true
+  fi
+
+  if [ -f "$TMPDIR/pydantic_core_tur.whl" ]; then
     # First try direct install
-    if ! "$PY_CMD" -m pip install --no-cache-dir --break-system-packages "$TMPDIR/pydantic_core_tur.whl" >> "$LOG_DIR/p2_pip.log" 2>&1; then
-      # If rejected due to platform tag (e.g. bionic vs linux_aarch64), adjust tag to any or current platform
+    if ! "$PY_CMD" -m pip install --no-cache-dir --break-system-packages --no-deps "$TMPDIR/pydantic_core_tur.whl" >> "$LOG_DIR/p2_pip.log" 2>&1; then
+      # If rejected due to platform tag (e.g. bionic vs linux_aarch64), adjust tag to current platform
       _CUR_TAG=$("$PY_CMD" -c 'import packaging.tags as t; print(list(t.sys_tags())[0])' 2>/dev/null || echo "")
       if [ -n "$_CUR_TAG" ]; then
-        mv "$TMPDIR/pydantic_core_tur.whl" "$TMPDIR/pydantic_core-2.27.2-${_CUR_TAG}.whl" 2>/dev/null || true
-        "$PY_CMD" -m pip install --no-cache-dir --break-system-packages "$TMPDIR"/pydantic_core-2.27.2-*.whl >> "$LOG_DIR/p2_pip.log" 2>&1 || true
+        mv "$TMPDIR/pydantic_core_tur.whl" "$TMPDIR/pydantic_core-${TUR_CORE_VER}-${_CUR_TAG}.whl" 2>/dev/null || true
+        "$PY_CMD" -m pip install --no-cache-dir --break-system-packages --no-deps "$TMPDIR"/pydantic_core-${TUR_CORE_VER}-*.whl >> "$LOG_DIR/p2_pip.log" 2>&1 || true
       fi
     fi
+  fi
+
+  if "$PY_CMD" -c "import pydantic_core" >/dev/null 2>&1; then
+    ok "pydantic_core prebuilt wheel installed successfully ($TUR_CORE_VER)"
+    "$PY_CMD" -m pip install --quiet --no-cache-dir --break-system-packages --no-deps "pydantic>=2.11.0,<2.12" "pydantic-settings" >> "$LOG_DIR/p2_pip.log" 2>&1 || true
   fi
 fi
 
@@ -1073,7 +1095,7 @@ if [ "$NO_EDITABLE" -eq 1 ]; then
   warn "skipping editable install (--no-editable)"
 else
   step "Phase 2: Editable install of MCPSearch"
-  timeout 120 "$PY_CMD" -m pip install --quiet --no-cache-dir --break-system-packages -e "$APP_DIR" > "$LOG_DIR/p2_editable.log" 2>&1 \
+  timeout 120 "$PY_CMD" -m pip install --quiet --no-cache-dir --break-system-packages --no-deps -e "$APP_DIR" > "$LOG_DIR/p2_editable.log" 2>&1 \
     && ok "editable install complete" || fatal "editable install failed (see $LOG_DIR/p2_editable.log)"
 fi
 
