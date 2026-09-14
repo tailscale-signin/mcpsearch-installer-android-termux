@@ -1,11 +1,11 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # ============================================================================
-# MCPSearch Termux Bootstrap — one-command setup (v1.2)
+# MCPSearch Termux Bootstrap — one-command setup (v1.3)
 #
 # Does everything in a single run:
-#   1. Update package lists (pkg update)
-#   2. Upgrade installed packages safely (pkg upgrade + openssl sync to prevent curl breakage)
-#   3. Install git (and curl, for safety)
+#   1. Update package lists (pkg update) with auto-retry and timeout guards
+#   2. Upgrade installed packages safely (pkg upgrade + openssl sync)
+#   3. Install git (and curl, for safety) with mirror fallback & recovery
 #   4. Clone this installer repo
 #   5. Run install_mcpsearch.sh (passes through all CLI flags and options)
 #
@@ -24,11 +24,14 @@
 # ============================================================================
 set -uo pipefail
 
-VERSION="1.2.0"
+VERSION="1.3.0"
 REPO_URL="https://github.com/tailscale-signin/mcpsearch-installer-android-termux.git"
 INSTALLER_BRANCH="main"
 INSTALLER_DIR="$HOME/mcpsearch-installer-android-termux"
 LOG_DIR="$HOME/.mcpsearch_logs"
+
+export DEBIAN_FRONTEND=noninteractive
+APT_RETRY_FLAGS="-y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 step(){ echo -e "\n${CYAN}▶ $*${NC}"; }
@@ -60,34 +63,90 @@ mkdir -p "$LOG_DIR"
 
 echo -e "${BOLD}${CYAN}== MCPSearch Termux Bootstrap (v$VERSION) ==${NC}"
 
+# Robust package manager helper with auto-clean and mirror switch on I/O failure
+run_apt_with_retry() {
+  local op="$1"
+  shift
+  local pkgs="$*"
+  local max_retries=3
+  local attempt=1
+
+  while [ "$attempt" -le "$max_retries" ]; do
+    case "$op" in
+      update)
+        if apt-get update $APT_RETRY_FLAGS >> "$LOG_DIR/bootstrap_pkg.log" 2>&1; then
+          return 0
+        fi
+        ;;
+      upgrade)
+        if apt-get upgrade $APT_RETRY_FLAGS --fix-missing >> "$LOG_DIR/bootstrap_pkg.log" 2>&1; then
+          return 0
+        fi
+        ;;
+      install)
+        if apt-get install $APT_RETRY_FLAGS --fix-missing $pkgs >> "$LOG_DIR/bootstrap_pkg.log" 2>&1; then
+          return 0
+        fi
+        ;;
+    esac
+
+    warn "apt-get $op failed (attempt $attempt/$max_retries). Cleaning partial cache and retrying..."
+    apt-get clean >> "$LOG_DIR/bootstrap_pkg.log" 2>&1 || true
+    dpkg --configure -a >> "$LOG_DIR/bootstrap_pkg.log" 2>&1 || true
+    apt-get --fix-broken install $APT_RETRY_FLAGS >> "$LOG_DIR/bootstrap_pkg.log" 2>&1 || true
+
+    # If mirror is throwing repeated I/O errors, fall back to default official repo
+    if grep -Eq "(I/O error|Failed to fetch|Error reading from server)" "$LOG_DIR/bootstrap_pkg.log" 2>/dev/null; then
+      if [ -f "$PREFIX/etc/apt/sources.list" ] && grep -q "mirrors.hust.edu.cn" "$PREFIX/etc/apt/sources.list"; then
+        warn "Detected failing mirror (mirrors.hust.edu.cn), switching to official termux.dev mirror..."
+        sed -i 's|https://mirrors.hust.edu.cn/termux|https://packages.termux.dev/apt|g' "$PREFIX/etc/apt/sources.list" 2>/dev/null || true
+      fi
+    fi
+
+    attempt=$((attempt + 1))
+    sleep 2
+  done
+
+  return 1
+}
+
 # ---------------------------------------------------------------- STEP 1
-step "Step 1: Update package lists (pkg update)"
-pkg update -y > "$LOG_DIR/bootstrap_pkg.log" 2>&1 \
-  && ok "pkg update" || warn "pkg update had issues (see $LOG_DIR/bootstrap_pkg.log)"
+step "Step 1: Update package lists (apt-get update)"
+if run_apt_with_retry update; then
+  ok "apt-get update"
+else
+  warn "apt-get update had issues (see $LOG_DIR/bootstrap_pkg.log)"
+fi
 
 # ---------------------------------------------------------------- STEP 2
 if [ "$SKIP_UPGRADE" -eq 1 ]; then
   step "Step 2: Upgrade installed packages (skipped via --skip-upgrade)"
 else
-  step "Step 2: Upgrade installed packages (pkg upgrade)"
-  pkg upgrade -y >> "$LOG_DIR/bootstrap_pkg.log" 2>&1 \
-    && ok "pkg upgrade" || warn "pkg upgrade had issues (see $LOG_DIR/bootstrap_pkg.log)"
+  step "Step 2: Upgrade installed packages (apt-get upgrade)"
+  if run_apt_with_retry upgrade; then
+    ok "apt-get upgrade"
+  else
+    warn "apt-get upgrade had issues (see $LOG_DIR/bootstrap_pkg.log)"
+  fi
 fi
 
-# Ensure openssl and curl libraries are synchronized to avoid partial upgrade linker errors
-pkg install -y openssl >> "$LOG_DIR/bootstrap_pkg.log" 2>&1 || true
+# Ensure openssl is synchronized
+run_apt_with_retry install openssl || true
 
 # ---------------------------------------------------------------- STEP 3
-step "Step 3: Install git (and curl)"
-pkg install -y git curl >> "$LOG_DIR/bootstrap_pkg.log" 2>&1 \
-  && ok "git + curl installed" || fatal "failed to install git/curl (see $LOG_DIR/bootstrap_pkg.log)"
+step "Step 3: Install git and curl"
+if run_apt_with_retry install git curl; then
+  ok "git + curl installed"
+else
+  fatal "failed to install git/curl after multiple retries (see $LOG_DIR/bootstrap_pkg.log)"
+fi
 
 # Sanity check curl linkage after package install
 if ! curl --version >/dev/null 2>&1; then
-  warn "curl binary has library linkage mismatch; attempting apt repair"
-  apt update >> "$LOG_DIR/bootstrap_pkg.log" 2>&1 || true
-  apt --fix-broken install -y >> "$LOG_DIR/bootstrap_pkg.log" 2>&1 || true
-  apt install -y --reinstall openssl libcurl curl >> "$LOG_DIR/bootstrap_pkg.log" 2>&1 || true
+  warn "curl binary has library linkage mismatch; attempting repair"
+  apt-get clean >> "$LOG_DIR/bootstrap_pkg.log" 2>&1 || true
+  apt-get --fix-broken install $APT_RETRY_FLAGS >> "$LOG_DIR/bootstrap_pkg.log" 2>&1 || true
+  apt-get install $APT_RETRY_FLAGS --reinstall openssl libcurl curl >> "$LOG_DIR/bootstrap_pkg.log" 2>&1 || true
   curl --version >/dev/null 2>&1 || fatal "curl remains broken after repair attempts (see $LOG_DIR/bootstrap_pkg.log)"
 fi
 
